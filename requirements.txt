@@ -1,0 +1,6 @@
+gmsh
+trimesh
+torch
+torchvision
+torch_geometric
+pyvista[jupyter]

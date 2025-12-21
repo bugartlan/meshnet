@@ -1,0 +1,18 @@
+name: meshnet
+channels:
+  - conda-forge
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - python=3.12
+  - ipykernel
+  - jupyterlab
+  - notebook
+  - ipywidgets
+  - scipy
+  - fenics-dolfinx=0.9.0
+  - pyvista
+  - mpich
+  - rtree
+  - pyglet<2
+prefix: /Users/bugart/miniconda3/envs/meshnet
