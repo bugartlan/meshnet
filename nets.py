@@ -12,7 +12,7 @@ class Mlp(nn.Module):
         activation=nn.ReLU,
         activate_final=False,
     ):
-        super(Mlp, self).__init__()
+        super().__init__()
         layers = [
             nn.Linear(input_dim, hidden_dim),
             activation(),
@@ -30,7 +30,7 @@ class Mlp(nn.Module):
 
 class Processor(nn.Module):
     def __init__(self, dim, layer_norm=False):
-        super(Processor, self).__init__()
+        super().__init__()
         # Update mesh edges
         # self.mesh_edge_mlp = self._make_mlp(3 * dim, dim, layer_norm)
         # Update contact edges
@@ -53,14 +53,19 @@ class Processor(nn.Module):
         return net
 
     def _aggregate_edges(self, edge_index, edge_attr, num_nodes):
+        device = edge_attr.device
+        dtype = edge_attr.dtype
+
         D = edge_attr.size(1)
-        idx = edge_index[0].unsqueeze(-1).expand(-1, D)
-        agg = torch.zeros(
-            (num_nodes, edge_attr.size(1)),
-            device=edge_attr.device,
-            dtype=edge_attr.dtype,
-        )
-        return torch.scatter_add(agg, 0, idx, edge_attr)
+        idx = edge_index[1].unsqueeze(-1).expand(-1, D)
+        agg = torch.zeros((num_nodes, D), device=device, dtype=dtype)
+        deg = torch.zeros((num_nodes, 1), device=device, dtype=dtype)
+        deg.scatter_add_(
+            0,
+            edge_index[1].unsqueeze(-1),
+            torch.ones((edge_index.size(1), 1), device=device, dtype=dtype),
+        ).clamp_(min=1.0)
+        return torch.scatter_add(agg, 0, idx, edge_attr) / deg
 
     def forward(
         self, x, mesh_edge_index, mesh_edge_attr, contact_edge_index, contact_edge_attr
@@ -103,7 +108,7 @@ class EncodeProcessDecode(nn.Module):
         message_passing_steps=10,
         use_layer_norm=False,
     ):
-        super(EncodeProcessDecode, self).__init__()
+        super().__init__()
 
         self._output_dim = output_dim
         self._latent_dim = latent_dim
@@ -131,9 +136,6 @@ class EncodeProcessDecode(nn.Module):
             layer_norm=self._use_layernorm,
         )
         self._processor = Processor(self._latent_dim, layer_norm=self._use_layernorm)
-        # self._processors = nn.ModuleList(
-        #     [Processor(self._latent_dim) for _ in range(self._message_passing_steps)]
-        # )
         self._decoder = self._make_mlp(self._latent_dim, self._output_dim, False)
 
     def _make_mlp(self, input_dim, output_dim, layer_norm):
@@ -179,16 +181,53 @@ class EncodeProcessDecode(nn.Module):
             contact_edge_index,
             contact_edges,
         ) = self._encoder(graph)
-        # for _, processor in enumerate(self._processors):
-        #     x, mesh_edges, contact_edges = processor(
-        #         x,
-        #         mesh_edge_index,
-        #         mesh_edges,
-        #         contact_edge_index,
-        #         contact_edges,
-        #     )
         for _ in range(self._message_passing_steps):
             x, mesh_edges, contact_edges = self._processor(
+                x,
+                mesh_edge_index,
+                mesh_edges,
+                contact_edge_index,
+                contact_edges,
+            )
+        return self._decoder(x)
+
+
+class UnsharedEncodeProcessDecode(EncodeProcessDecode):
+    def __init__(
+        self,
+        node_dim,
+        mesh_edge_dim,
+        contact_edge_dim,
+        output_dim,
+        latent_dim=128,
+        num_layers=2,
+        message_passing_steps=10,
+        use_layer_norm=False,
+    ):
+        super().__init__(
+            node_dim,
+            mesh_edge_dim,
+            contact_edge_dim,
+            output_dim,
+            latent_dim,
+            num_layers,
+            message_passing_steps,
+            use_layer_norm,
+        )
+        self._processors = nn.ModuleList(
+            [Processor(self._latent_dim) for _ in range(self._message_passing_steps)]
+        )
+
+    def forward(self, graph: HeteroData):
+        (
+            x,
+            mesh_edge_index,
+            mesh_edges,
+            contact_edge_index,
+            contact_edges,
+        ) = self._encoder(graph)
+        for _, processor in enumerate(self._processors):
+            x, mesh_edges, contact_edges = processor(
                 x,
                 mesh_edge_index,
                 mesh_edges,

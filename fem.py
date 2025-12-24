@@ -173,6 +173,39 @@ def eval(domain, func, points):
     tree = geometry.bb_tree(domain, domain.topology.dim)
     candidates = geometry.compute_collisions_points(tree, points)
     colliding_cells = geometry.compute_colliding_cells(domain, candidates, points)
+
+    eval_point_indices = []
+    eval_cell_ids = []
+    for i in range(points.shape[0]):
+        cell_ids = colliding_cells.links(i)
+        if len(cell_ids) > 0:
+            for cid in cell_ids:
+                eval_point_indices.append(i)
+                eval_cell_ids.append(cid)
+
+    if len(eval_point_indices) == 0:
+        return np.zeros((0,), dtype=np.float64)
+
+    raw_values = func.eval(points[eval_point_indices], eval_cell_ids)
+    accumulated_values = np.zeros(
+        (points.shape[0], raw_values.shape[1]), dtype=raw_values.dtype
+    )
+    counts = np.zeros((points.shape[0], 1), dtype=np.int32)
+
+    np.add.at(accumulated_values, eval_point_indices, raw_values)
+    np.add.at(counts, eval_point_indices, 1)
+
+    mask_found = counts > 0
+    accumulated_values[mask_found] /= counts[mask_found]
+
+    return accumulated_values[mask_found].reshape(-1, 1)
+
+
+def eval_dg0(domain, func, points):
+    points = np.asarray(points)
+    tree = geometry.bb_tree(domain, domain.topology.dim)
+    candidates = geometry.compute_collisions_points(tree, points)
+    colliding_cells = geometry.compute_colliding_cells(domain, candidates, points)
     cells = np.full(points.shape[0], -1, dtype=np.int32)
     for i in range(points.shape[0]):
         cell_ids = colliding_cells.links(i)

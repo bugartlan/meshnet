@@ -8,8 +8,45 @@ from torch_geometric.data import HeteroData
 from fem import eval, fea
 
 
-def is_root_node(vertex: np.ndarray, tol: float = 1e-6) -> np.ndarray:
+def is_root_node(vertex: np.ndarray, tol: float = 1e-3) -> np.ndarray:
     return np.isclose(vertex[:, 2], 0.0, atol=tol)
+
+
+def project_contacts(
+    mesh: trimesh.Trimesh,
+    contacts: list[tuple] | None = None,
+) -> tuple[np.ndarray, dict]:
+    """
+    Project contact points onto the mesh and distributes forces barycentrically to the vertices.
+    """
+    contact_forces = {}
+
+    if contacts is None or len(contacts) == 0:
+        return np.array([], dtype=np.int64), contact_forces
+
+    points, forces = zip(*contacts)
+    points = np.asarray(points).reshape(-1, 3)
+    forces = np.asarray(forces).reshape(-1, 3)
+
+    # Find closest surface points and triangles
+    closest, distance, triangle_ids = trimesh.proximity.closest_point(mesh, points)
+
+    if np.any(distance > 1e-5):
+        raise ValueError("At least one contact point is not on the mesh surface.")
+
+    # Compute Barycentric weights
+    # Shape: (N, 3, 3)
+    triangle_coords = mesh.vertices[mesh.faces[triangle_ids]]
+    barycentric_weights = trimesh.triangles.points_to_barycentric(
+        triangle_coords, closest
+    )
+
+    # Distribute forces vectors: Force * Weight
+    # Shape: (N, 3, 3) -> (Contact, Vertex, Force)
+    forces = (forces[:, None, :] * barycentric_weights[:, :, None]).reshape(-1, 3)
+    vertices = mesh.faces[triangle_ids].flatten()
+
+    return vertices, {i: f for i, f in zip(vertices, forces)}
 
 
 def build_graph(
@@ -17,26 +54,7 @@ def build_graph(
 ) -> HeteroData:
     graph = HeteroData()
 
-    if contacts is None:
-        contacts = []
-
-    contact_vertex_indices = np.array([], dtype=np.int64)
-    contact_forces = dict()
-
-    if len(contacts) > 0:
-        contact_points, contact_forces = zip(*contacts)
-        contact_points = np.asarray(contact_points).reshape(-1, 3)
-
-        closest, distance, triangle_id = trimesh.proximity.closest_point(
-            mesh, contact_points
-        )
-
-        if np.any(distance > 1e-6):
-            raise ValueError("At least one contact point is not on the mesh surface.")
-
-        contact_vertex_indices = mesh.faces[triangle_id][:, 0]
-        # What if multiple contact points map to the same vertex?
-        contact_forces = {i: f for i, f in zip(contact_vertex_indices, contact_forces)}
+    contact_vertex_indices, contact_forces = project_contacts(mesh, contacts)
 
     graph["node"].x = build_node_features(mesh, contact_vertex_indices, contact_forces)
     graph["node"].y = build_node_labels(mesh, graph["node"].x, domain, func)
@@ -112,23 +130,16 @@ def build_edges(
     for v1, v2 in mesh.edges_unique:
         disp = mesh.vertices[v2] - mesh.vertices[v1]
         dist = np.linalg.norm(disp)
-        # What if both vertices are contact vertices?
-        if v1 in contact_vertex_set or v2 in contact_vertex_set:
-            contact_edge_index.extend([(v1, v2), (v2, v1)])
-            force = (
-                contact_forces[v1] / mesh.vertex_degree[v1]
-                if v1 in contact_vertex_set
-                else contact_forces[v2] / mesh.vertex_degree[v2]
-            )
-            contact_edge_attr.extend(
-                [
-                    np.hstack([disp, dist, force]),
-                    np.hstack([-disp, dist, force]),
-                ]
-            )
-        else:
-            mesh_edge_index.extend([(v1, v2), (v2, v1)])
-            mesh_edge_attr.extend([np.hstack([disp, dist]), np.hstack([-disp, dist])])
+        if v1 in contact_vertex_set:
+            contact_edge_index.append((v1, v2))
+            force = contact_forces[v1]
+            contact_edge_attr.append(np.hstack([disp, dist, force]))
+        elif v2 in contact_vertex_set:
+            contact_edge_index.append((v2, v1))
+            force = contact_forces[v2]
+            contact_edge_attr.append(np.hstack([-disp, dist, force]))
+        mesh_edge_index.extend([(v1, v2), (v2, v1)])
+        mesh_edge_attr.extend([np.hstack([disp, dist]), np.hstack([-disp, dist])])
 
     def to_edge_tensor(edges):
         if len(edges) == 0:
@@ -181,26 +192,66 @@ def generate_data_one(
     return graphs
 
 
+def generate_data_from_list(
+    mesh: trimesh.Trimesh,
+    f: np.ndarray,
+    points: list[int],
+    stl="cantilever.stl",
+    msh="cantilever.msh",
+    output_filename="cantilever_0.pt",
+) -> list[HeteroData]:
+    """Generate n graphs from given contact points on one given mesh."""
+    graphs = []
+    points = np.asarray(points).reshape(-1, 3)
+    for i in range(len(points)):
+        print(f"Generating graph {i + 1}/{len(points)}...")
+        contact_point = points[i]
+        contacts = [(contact_point, f)]
+
+        domain, stresses_vm = fea(
+            contacts,
+            contact_radius=2.0,
+            debug=False,
+            filename_stl=stl,
+            filename_msh=msh,
+        )
+        graph = build_graph(mesh, domain, stresses_vm, contacts=contacts)
+        graphs.append(graph)
+
+    torch.save(graphs, output_filename)
+    print(f"Saved dataset with {len(graphs)} graphs to {output_filename}.")
+    return graphs
+
+
 if __name__ == "__main__":
     filename = "cantilever"
     input_dir = "meshes/"
     output_dir = "data/"
     stl = f"{input_dir}{filename}.stl"
     msh = f"{input_dir}{filename}.msh"
-    F = 1.0
-    N = 10
+    F = 10.0
+    N = 2
 
     start = time.time()
 
     # Load mesh and generate dataset
     mesh = trimesh.load_mesh(stl)
-    generate_data_one(
+    # generate_data_one(
+    #     mesh,
+    #     max_f=F,
+    #     n=N,
+    #     stl=stl,
+    #     msh=msh,
+    #     output_filename=f"{output_dir}{filename}_{N}.pt",
+    # )
+
+    generate_data_from_list(
         mesh,
-        max_f=F,
-        n=N,
+        f=np.array([F, 0.0, 0.0]),
+        points=[(0.0, 5.0, 10.0), (0.0, 5.0, 20.0)],
         stl=stl,
         msh=msh,
-        output_filename=f"{output_dir}{filename}_{N}.pt",
+        output_filename=f"{output_dir}{filename}_2.pt",
     )
 
     end = time.time()
