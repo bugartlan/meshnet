@@ -15,4 +15,5 @@ dependencies:
   - mpich
   - rtree
   - pyglet<2
+  - meshio
 prefix: /Users/bugart/miniconda3/envs/meshnet
