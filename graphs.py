@@ -22,9 +22,7 @@ from torch_geometric.data import Data
 tol_dirichlet = 1e-3
 
 
-def project_contacts(
-    mesh: meshio.Mesh, contacts: list[tuple] | None = None
-) -> tuple[np.ndarray, dict]:
+def project_contacts(mesh: meshio.Mesh, contacts: list[tuple] | None = None) -> dict:
     """
     Project contact points onto the mesh and distributes forces barycentrically to the vertices.
     """
@@ -77,11 +75,21 @@ def find_contact_patches(
     points = np.asarray(points).reshape(-1, 3)
     forces = np.asarray(forces).reshape(-1, 3)
 
-    contact_nodes = {}
-    for p, f in contacts:
-        for i, v in enumerate(mesh.points):
-            if np.linalg.norm(v - p) <= r:
-                contact_nodes[i] = f
+    # Find closest surface points and their normals
+    faces = np.vstack([c.data for c in mesh.cells if c.type == "triangle"])
+    tm = trimesh.Trimesh(vertices=mesh.points, faces=faces, process=False)
+
+    closest, distance, triangle_ids = trimesh.proximity.closest_point(tm, points)
+    within = np.linalg.norm(mesh.points[None, :, :] - points[:, None, :], axis=-1) <= r
+    aligned = (tm.face_normals[triangle_ids] @ tm.vertex_normals.T) > 0.5
+    mask = within & aligned
+
+    contact_nodes: dict[int, np.ndarray] = {}
+    for j in range(points.shape[0]):
+        idx = np.where(mask[j])[0]
+        f = forces[j] / np.sum(mask[j])
+        for i in idx:
+            contact_nodes[i] = contact_nodes.get(i, 0.0) + f
 
     return contact_nodes
 
@@ -93,14 +101,18 @@ def build_graph(
 ) -> Data:
     # Node feature matrix with shape [num_nodes, num_node_features]
     # x = make_nodes(mesh, project_contacts(mesh, contacts))
-    x = make_nodes(mesh, find_contact_patches(mesh, r=2.0, contacts=contacts))
+    x = make_nodes(mesh, find_contact_patches(mesh, r=2.0, contacts=contacts), contacts)
     y = torch.tensor(y, dtype=torch.float32)
     edge_index, edge_attr = make_edges(mesh)
 
     return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
 
 
-def make_nodes(mesh: meshio.Mesh, loads: dict[int, np.ndarray]):
+def make_nodes(
+    mesh: meshio.Mesh,
+    loads: dict[int, np.ndarray],
+    reference: list[tuple] | None = None,
+) -> torch.Tensor:
     v = mesh.points
     n = v.shape[0]
 
@@ -114,13 +126,16 @@ def make_nodes(mesh: meshio.Mesh, loads: dict[int, np.ndarray]):
         val = np.array(list(loads.values()))
         forces[idx] = torch.tensor(val, dtype=torch.float32)
 
-    vec = torch.tensor(v - v[list(loads.keys())[0]], dtype=torch.float32)
+    # Global position vector
+    vec_pos = torch.tensor(v - reference[0][0], dtype=torch.float32)
+    # Global force vector
+    vec_force = torch.tensor(reference[0][1], dtype=torch.float32).repeat(n, 1)
 
     # Boundary mask
     mask = torch.zeros((n, 1), dtype=torch.float32)
     mask[np.isclose(v[:, 2], 0.0, atol=tol_dirichlet)] = 1
 
-    return torch.hstack([coords, forces, vec, mask])
+    return torch.hstack([coords, forces, vec_pos, vec_force, mask])
 
 
 def make_edges(mesh: meshio.Mesh) -> torch.Tensor:

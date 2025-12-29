@@ -1,41 +1,135 @@
-import matplotlib.pyplot as plt
+import argparse
+from pathlib import Path
+
+import meshio
 import torch
 import torch.nn.functional as F
-import trimesh
 from torch_geometric.loader import DataLoader
 
-from create_dataset import visualize
 from nets import EncodeProcessDecode
+from utils import info, msh_to_trimesh, normalize, visualize
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
 
-graphs = torch.load("cantilever_10.pt", weights_only=False)
-loader = DataLoader(graphs, batch_size=1, shuffle=False)
+def parse_args():
+    p = argparse.ArgumentParser(description="Evaluate trained model on a dataset.")
+    p.add_argument(
+        "--model-path",
+        type=Path,
+        default=Path("models/model.pth"),
+        help="Path to the trained model file.",
+    )
+    p.add_argument(
+        "--graphs-path",
+        type=Path,
+        default=Path("data/cantilever_10.pt"),
+        help="Path to the graph dataset file.",
+    )
+    p.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to run the model on (e.g., 'cpu' or 'cuda').",
+    )
+    p.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("plots/"),
+        help="Directory to save the visualization plots.",
+    )
+    p.add_argument(
+        "--save-plots",
+        action="store_true",
+        help="Whether to save the visualization plots to the output directory.",
+    )
+    p.add_argument(
+        "--mesh-name",
+        type=str,
+        default="cantilever",
+        help="Base filename (without extension) for .stl and .msh files.",
+    )
+    p.add_argument(
+        "--input-dir",
+        type=Path,
+        default=Path("meshes"),
+        help="Directory containing .stl and .msh.",
+    )
+    return p.parse_args()
 
-mesh = trimesh.load_mesh("cantilever.stl")
-g = graphs[7]
-node_dim = g.num_node_features["node"]
-mesh_edge_dim = g.num_edge_features["node", "mesh", "node"]
-contact_edge_dim = g.num_edge_features["node", "contact", "node"]
-latent_dim = 128
-output_dim = 1  # predicting Von Mises stress
 
-model = EncodeProcessDecode(
-    node_dim=node_dim,
-    mesh_edge_dim=mesh_edge_dim,
-    contact_edge_dim=contact_edge_dim,
-    output_dim=output_dim,
-    latent_dim=latent_dim,
-    use_layer_norm=False,
-).to(device)
+def main():
+    args = parse_args()
 
-checkpoint = torch.load(
-    "model.pth", map_location=torch.device("cpu"), weights_only=True
-)
-model.load_state_dict(checkpoint)
+    if args.save_plots and not args.output_dir.exists():
+        args.output_dir.mkdir(parents=True)
 
-visualize(mesh, g)
-g_pred = g.clone()
-g_pred["node"].y = model(g_pred.to(device)).detach()
-visualize(mesh, g_pred)
+    device = torch.device(args.device)
+    print("Using device:", device)
+
+    graphs = torch.load(args.graphs_path, weights_only=False)
+
+    latent_dim = 128
+    node_dim, edge_dim, output_dim = info(graphs[0], debug=True)
+
+    model = EncodeProcessDecode(
+        node_dim=node_dim,
+        edge_dim=edge_dim,
+        output_dim=output_dim,
+        latent_dim=latent_dim,
+        message_passing_steps=15,
+        use_layer_norm=True,
+    ).to(device)
+
+    checkpoint = torch.load(
+        args.model_path, map_location=torch.device("cpu"), weights_only=True
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    stats = checkpoint["stats"]
+    loader = DataLoader(
+        [normalize(g, stats) for g in graphs], batch_size=1, shuffle=False
+    )
+
+    total_loss = 0.0
+    total_nodes = 0
+
+    for batch in loader:
+        batch = batch.to(device)
+
+        y_pred = model(batch)
+        y_true = batch.y
+
+        loss = F.mse_loss(y_pred, y_true)
+        loss.backward()
+
+        total_loss += loss.item() * batch.num_nodes
+        total_nodes += batch.num_nodes
+    avg_loss = total_loss / total_nodes
+    print(f"Average MSE Loss over dataset: {avg_loss:.6f}")
+
+    if args.save_plots:
+        mesh = msh_to_trimesh(meshio.read("meshes/cantilever.msh"))
+        for i, g in enumerate(graphs):
+            g = g.to(device)
+            g_pred = g.clone()
+            g_pred.y = model(normalize(g, stats).to(device)).detach()
+            g_pred.y = g_pred.y * stats["y_std"].to(device) + stats["y_mean"].to(device)
+
+            visualize(
+                mesh,
+                g,
+                force_arrows=True,
+                show=False,
+                filename=args.output_dir / f"truth_{i}.html",
+            )
+            visualize(
+                mesh,
+                g_pred,
+                force_arrows=True,
+                show=False,
+                filename=args.output_dir / f"pred_{i}.html",
+            )
+
+
+if __name__ == "__main__":
+    main()
