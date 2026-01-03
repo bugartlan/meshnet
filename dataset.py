@@ -21,7 +21,7 @@ def make_dataset(
     """Generate n graphs from given contact points on one given mesh."""
     graphs = []
     for p, f_vec in zip(points, f):
-        contacts = [(p, f_vec)]
+        contacts = list(zip(p, f_vec))
 
         domain, stresses_vm = fea(
             contacts,
@@ -64,6 +64,12 @@ def parse_args():
         help="Number of surface sample points.",
     )
     p.add_argument(
+        "--num-contacts",
+        type=int,
+        default=1,
+        help="Number of contact points per sample.",
+    )
+    p.add_argument(
         "-F",
         "--force-max",
         type=float,
@@ -94,7 +100,7 @@ def main():
     out_path = (
         args.out
         if args.out is not None
-        else args.output_dir / f"{args.name}_{args.num_samples}.pt"
+        else args.output_dir / f"{args.name}_{args.num_contacts}_{args.num_samples}.pt"
     )
 
     rng = np.random.default_rng(args.seed)
@@ -102,11 +108,15 @@ def main():
     start = time.time()
 
     # Load mesh and generate dataset
+    n_samples = args.num_samples * args.num_contacts
     mesh = trimesh.load_mesh(stl)
-    points, face_ids = trimesh.sample.sample_surface(mesh, count=args.num_samples)
+    points, face_ids = trimesh.sample.sample_surface(mesh, count=n_samples)
+    points = points.reshape(args.num_samples, args.num_contacts, 3)
 
     forces = rng.uniform(
-        low=-args.force_max, high=args.force_max, size=(args.num_samples, 3)
+        low=-args.force_max,
+        high=args.force_max,
+        size=(args.num_samples, args.num_contacts, 3),
     )
     mesh_mio = meshio.read(msh)
     graphs = make_dataset(mesh_mio, forces, points, stl=stl, msh=msh)

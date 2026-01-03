@@ -53,6 +53,11 @@ def parse_args():
         default=Path("meshes"),
         help="Directory containing .stl and .msh.",
     )
+    p.add_argument(
+        "--weighted-loss",
+        action="store_true",
+        help="Whether to use weighted MSE loss based on node positions.",
+    )
     return p.parse_args()
 
 
@@ -92,6 +97,7 @@ def main():
 
     total_loss = 0.0
     total_nodes = 0
+    alpha = 0.1  # exponential scaling factor for mse loss
 
     for batch in loader:
         batch = batch.to(device)
@@ -99,7 +105,14 @@ def main():
         y_pred = model(batch)
         y_true = batch.y
 
-        loss = F.mse_loss(y_pred, y_true)
+        if args.weighted_loss:
+            weight = torch.exp(-alpha * batch.x[:, 2].unsqueeze(1))
+            weight = weight / weight.mean()
+            loss = F.mse_loss(y_pred, y_true, weight=weight)
+        else:
+            weight = torch.ones_like(y_true)
+
+        loss = F.mse_loss(y_pred, y_true, weight=weight)
         loss.backward()
 
         total_loss += loss.item() * batch.num_nodes
