@@ -19,9 +19,9 @@ def parse_args():
         help="Path to the trained model file.",
     )
     p.add_argument(
-        "--graphs-path",
+        "--dataset",
         type=Path,
-        default=Path("data/cantilever_10.pt"),
+        default=Path("data/cantilever_1_10.pt"),
         help="Path to the graph dataset file.",
     )
     p.add_argument(
@@ -70,7 +70,7 @@ def main():
     device = torch.device(args.device)
     print("Using device:", device)
 
-    graphs = torch.load(args.graphs_path, weights_only=False)
+    graphs = torch.load(args.dataset, weights_only=False)
 
     latent_dim = 128
     node_dim, edge_dim, output_dim = info(graphs[0], debug=True)
@@ -123,7 +123,6 @@ def main():
     if args.save_plots:
         mesh = msh_to_trimesh(meshio.read("meshes/cantilever.msh"))
         for i, g in enumerate(graphs):
-            g = g.to(device)
             g_pred = g.clone()
             g_pred.y = model(normalize(g, stats).to(device)).detach()
             g_pred.y = g_pred.y * stats["y_std"].to(device) + stats["y_mean"].to(device)

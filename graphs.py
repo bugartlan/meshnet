@@ -93,14 +93,12 @@ def make_nodes(
 
     # Global attributes
     # TODO: sorted by coords or forces if multiple contacts
-    Ps = []
-    Fs = []
+    Ps = []  # (len(reference), n, 3)
+    Fs = []  # (len(reference), n, 3)
     for p, f in reference:
         Ps.append(torch.tensor(v - p, dtype=torch.float32))
         Fs.append(torch.tensor(np.tile(f, (n, 1)), dtype=torch.float32))
-    inter = torch.stack([torch.stack(Ps), torch.stack(Fs)], dim=1).reshape(
-        -1, len(reference), 3
-    )
+    inter = torch.stack([torch.stack(Ps), torch.stack(Fs)], dim=1).reshape(-1, n, 3)
     attrs = inter.permute(1, 0, 2).reshape(n, -1)
 
     # Boundary mask

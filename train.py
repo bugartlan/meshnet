@@ -1,4 +1,5 @@
 import argparse
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -22,7 +23,7 @@ def parse_args():
     p.add_argument(
         "--filename",
         type=str,
-        default="model.pth",
+        default="model",
         help="Filename for the trained model file.",
     )
     p.add_argument(
@@ -136,6 +137,8 @@ def main():
     alpha = 0.1 if args.weighted_loss else 0.0
 
     loss_history = []
+    start = time.time()
+
     for epoch in tqdm(range(args.num_epochs)):
         model.train()
         total_loss = 0.0
@@ -177,6 +180,9 @@ def main():
         },
         args.output_dir / f"{args.filename}.pth",
     )
+
+    end = time.time()
+    print(f"Training completed in {end - start:.2f} seconds.")
 
     if args.plots:
         plt.plot(loss_history)
