@@ -3,3 +3,5 @@ archive
 data
 plots
 models
+meshes
+.vscode
