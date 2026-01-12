@@ -9,7 +9,7 @@ from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
 from nets import EncodeProcessDecode
-from utils import info, normalize
+from utils import normalize
 
 
 def parse_args():
@@ -28,9 +28,9 @@ def parse_args():
     )
     p.add_argument(
         "--dataset",
-        type=Path,
-        default=Path("data/cantilever_1_10.pt"),
-        help="Path to the graph dataset file.",
+        type=str,
+        default="cantilever_1_10",
+        help="Name of the graph dataset file (without extension).",
     )
     p.add_argument(
         "--device",
@@ -94,7 +94,9 @@ def main():
     args = parse_args()
 
     # Load dataset
-    graphs = torch.load(args.dataset, weights_only=False)
+    dataset_path = Path("data") / f"{args.dataset}.pt"
+    data = torch.load(dataset_path, weights_only=False)
+    graphs = data["graphs"]
 
     device = torch.device(args.device)
     train_x = torch.cat([g.x for g in graphs], dim=0)
@@ -116,12 +118,10 @@ def main():
         shuffle=False,
     )
 
-    node_dim, edge_dim, output_dim = info(graphs[0], debug=True)
-
     model = EncodeProcessDecode(
-        node_dim=node_dim,
-        edge_dim=edge_dim,
-        output_dim=output_dim,
+        node_dim=data["params"]["node_dim"],
+        edge_dim=data["params"]["edge_dim"],
+        output_dim=data["params"]["output_dim"],
         latent_dim=latent_dim,
         message_passing_steps=args.message_passing_steps,
         use_layer_norm=True,
@@ -169,9 +169,9 @@ def main():
         {
             "model_state_dict": model.state_dict(),
             "params": {
-                "node_dim": node_dim,
-                "edge_dim": edge_dim,
-                "output_dim": output_dim,
+                "node_dim": data["params"]["node_dim"],
+                "edge_dim": data["params"]["edge_dim"],
+                "output_dim": data["params"]["output_dim"],
                 "latent_dim": latent_dim,
                 "message_passing_steps": args.message_passing_steps,
                 "use_layer_norm": True,

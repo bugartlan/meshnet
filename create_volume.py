@@ -22,6 +22,12 @@ def parse_args():
         default=Path("meshes/thingi10k/msh"),
         help="Directory to save generated volumetric mesh files.",
     )
+    p.add_argument(
+        "--file",
+        type=Path,
+        default=None,
+        help="Optional specific STL file to process.",
+    )
     return p.parse_args()
 
 
@@ -61,21 +67,29 @@ def main():
     gmsh.initialize()
     gmsh.option.setNumber("General.Verbosity", 1)
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.file is not None:
+        stl_path = args.file
+        out_path = Path("meshes") / (stl_path.stem + ".msh")
+        create_volume(stl_path, out_path)
+    else:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    success_count = 0
-    fail_count = 0
-    for stl_path in args.input_dir.glob("*.stl"):
-        out_path = args.output_dir / (stl_path.stem + ".msh")
-        try:
-            create_volume(stl_path, out_path)
-            print(f"Processed {stl_path} -> {out_path}")
-            success_count += 1
-        except Exception as e:
-            print(f"Failed to process {stl_path}: {e}")
-            fail_count += 1
-            continue
-    print(f"Finished processing: {success_count} succeeded, {fail_count} failed.")
+        success_count = 0
+        fail_count = 0
+        for stl_path in args.input_dir.glob("*.stl"):
+            out_path = args.output_dir / (stl_path.stem + ".msh")
+            try:
+                create_volume(stl_path, out_path)
+                print(f"Processed {stl_path} -> {out_path}")
+                success_count += 1
+            except Exception:
+                print(f"Failed to process {stl_path}")
+                fail_count += 1
+                gmsh.finalize()
+                gmsh.initialize()
+                gmsh.option.setNumber("General.Verbosity", 1)
+                continue
+        print(f"Finished processing: {success_count} succeeded, {fail_count} failed.")
     gmsh.finalize()
 
 
