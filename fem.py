@@ -23,6 +23,7 @@ def sigma(u):
     return 2 * mu * epsilon(u) + lambda_ * ufl.tr(epsilon(u)) * ufl.Identity(len(u))
 
 
+# TODO: Cannot find contact patches when the meshes are sparse.
 def make_contact_patch(object_mesh, query, fdim, domain, x0, r, n, tag=1):
     """Tag boundary facets whose (sample) points lie within radius r of x0."""
 
@@ -38,7 +39,7 @@ def make_contact_patch(object_mesh, query, fdim, domain, x0, r, n, tag=1):
             + bary[:, 2:3] * vertex_normals[:, 2]
         )
         n_smooth /= np.linalg.norm(n_smooth, axis=1, keepdims=True)
-        return np.isclose(x.T, x0, atol=r).all(axis=1) & (
+        return (np.linalg.norm(x.T - x0, axis=1) < r) & (
             np.dot(n_smooth, n).reshape(-1) > 0.7
         )
 
@@ -47,7 +48,7 @@ def make_contact_patch(object_mesh, query, fdim, domain, x0, r, n, tag=1):
     return candidate_facets, values
 
 
-def visualize_contact(domain, facet_tags):
+def visualize_contact(domain, facet_tags, points=None):
     # Visualize the mesh and contact patches
     plotter = pyvista.Plotter()
     fdim = domain.topology.dim - 1
@@ -64,6 +65,12 @@ def visualize_contact(domain, facet_tags):
     facet_grid.cell_data["FacetTags"] = facet_values
     facet_grid.set_active_scalars("FacetTags")
     plotter.add_mesh(facet_grid, opacity=1, show_edges=True, line_width=0.1)
+
+    if points is not None:
+        sphere = pyvista.Sphere(radius=0.01)
+        for p in points:
+            sph = sphere.translate(p, inplace=False)
+            plotter.add_mesh(sph, color="red", opacity=1)
     plotter.show_axes()
     plotter.show()
 
@@ -138,13 +145,18 @@ def fea(
         ds = ufl.Measure("ds", domain=domain, subdomain_data=facet_tags)
         for f, tag in zip(contact_forces, contact_tags):
             area = fem.assemble_scalar(fem.form(1.0 * ds(tag)))
-            T = fem.Constant(domain, f / area)
+            T = fem.Constant(
+                domain, f / area if area > 0 else np.array([0.0, 0.0, 0.0])
+            )
             L += ufl.dot(T, v) * ds(tag)
 
     problem = LinearProblem(
         a, L, bcs=[bc], petsc_options={"ksp_type": "preonly", "pc_type": "lu"}
     )
     uh = problem.solve()
+
+    if np.isnan(uh.x.array).any():
+        raise RuntimeError("FEA solution contains NaN values.")
 
     # Stress computation
     s_von_mises = sigma(uh) - 1.0 / 3 * ufl.tr(sigma(uh)) * ufl.Identity(len(uh))
@@ -158,7 +170,8 @@ def fea(
 
     if debug:
         print(f"Domain bounds: {xmin} to {xmax} (m)")
-        visualize_contact(domain, facet_tags)
+        print("bottom_facets:", bottom_facets.size, "bottom_dofs:", bottom_dofs.size)
+        visualize_contact(domain, facet_tags, points=np.array(contact_positions))
         topology, cell_types, geometry = plot.vtk_mesh(domain, domain.topology.dim)
         warped_geometry = geometry + uh.x.array.reshape(-1, 3) * 1
         warped_grid = pyvista.UnstructuredGrid(topology, cell_types, warped_geometry)

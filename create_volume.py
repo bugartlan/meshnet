@@ -11,6 +11,12 @@ BOUNDARY_TAG = 2
 def parse_args():
     p = argparse.ArgumentParser(description="Create volumetric meshes from STL files.")
     p.add_argument(
+        "format",
+        type=str,
+        choices=["stl", "step"],
+        help="Format of the input file(s).",
+    )
+    p.add_argument(
         "--input-dir",
         type=Path,
         default=Path("meshes/thingi10k/stl"),
@@ -26,16 +32,16 @@ def parse_args():
         "--file",
         type=Path,
         default=None,
-        help="Optional specific STL file to process.",
+        help="Optional specific file to process.",
     )
     return p.parse_args()
 
 
-def create_volume(in_path: Path, out_path: Path):
+def create_volume_stl(stl_path: Path, out_path: Path):
     gmsh.clear()
 
     gmsh.model.add("mesh_volume")
-    gmsh.merge(str(in_path))
+    gmsh.merge(str(stl_path))
     gmsh.model.geo.removeAllDuplicates()
 
     angle_threshold = 45  # degrees
@@ -61,29 +67,100 @@ def create_volume(in_path: Path, out_path: Path):
     gmsh.write(str(out_path))
 
 
+TARGET_SIZE = 0.05  # (m)
+
+
+def create_volume_step(step_path: Path, out_path: Path, debug: bool = False):
+    gmsh.clear()
+
+    gmsh.model.add("mesh_volume")
+    gmsh.model.occ.importShapes(str(step_path))
+    gmsh.model.occ.synchronize()
+
+    # Check the model only consists of one volume
+    volumes = gmsh.model.getEntities(3)
+    if len(volumes) != 1:
+        raise RuntimeError("STEP file must contain exactly one volume entity.")
+
+    x0, y0, z0, x1, y1, z1 = gmsh.model.occ.getBoundingBox(3, 1)
+    dx = x1 - x0
+    dy = y1 - y0
+    dz = z1 - z0
+    max_dim = max(dx, dy, dz)
+    scale = TARGET_SIZE / max_dim
+
+    com = gmsh.model.occ.getCenterOfMass(3, 1)
+    gmsh.model.occ.translate(volumes, -com[0], -com[1], -com[2])
+    gmsh.model.occ.synchronize()
+    gmsh.model.occ.dilate(volumes, 0.0, 0.0, 0.0, scale, scale, scale)
+    gmsh.model.occ.synchronize()
+    x0, y0, z0, x1, y1, z1 = gmsh.model.occ.getBoundingBox(3, 1)
+    gmsh.model.occ.translate(volumes, 0, 0, -z0)
+    gmsh.model.occ.synchronize()
+
+    vol_tags = [v[1] for v in volumes]
+    gmsh.model.addPhysicalGroup(3, vol_tags, DOMAIN_TAG, name="domain")
+
+    surfaces = gmsh.model.getEntities(2)
+    surf_tags = [s[1] for s in surfaces]
+    gmsh.model.addPhysicalGroup(2, surf_tags, BOUNDARY_TAG, name="boundary")
+
+    gmsh.model.mesh.generate(3)
+
+    if debug:
+        x0, y0, z0, x1, y1, z1 = gmsh.model.occ.getBoundingBox(3, 1)
+        dx = x1 - x0
+        dy = y1 - y0
+        dz = z1 - z0
+        max_dim = max(dx, dy, dz)
+        print(f"Post-scale max dimension: {max_dim}")
+
+        node_tags, _, _ = gmsh.model.mesh.getNodes()
+        tri_tags, _ = gmsh.model.mesh.getElementsByType(2)
+        tet_tags, _ = gmsh.model.mesh.getElementsByType(4)
+
+        print("Number of nodes:", len(node_tags))
+        print("Number of triangles:", len(tri_tags))
+        print("Number of elements:", len(tet_tags))
+
+    gmsh.write(str(out_path))
+
+
+L = 0.005  # Characteristic length for mesh elements
+
+
 def main():
     args = parse_args()
 
     gmsh.initialize()
     gmsh.option.setNumber("General.Verbosity", 1)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthMin", L)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthMax", L)
+    gmsh.option.setString("Geometry.OCCTargetUnit", "M")
 
     if args.file is not None:
-        stl_path = args.file
-        out_path = Path("meshes") / (stl_path.stem + ".msh")
-        create_volume(stl_path, out_path)
+        in_path = args.file
+        out_path = Path("meshes") / (in_path.stem + ".msh")
+        if args.format == "stl":
+            create_volume_stl(in_path, out_path)
+        else:
+            create_volume_step(in_path, out_path, debug=True)
     else:
         args.output_dir.mkdir(parents=True, exist_ok=True)
 
         success_count = 0
         fail_count = 0
-        for stl_path in args.input_dir.glob("*.stl"):
-            out_path = args.output_dir / (stl_path.stem + ".msh")
+        for in_path in args.input_dir.glob(f"*.{args.format}"):
+            out_path = args.output_dir / (in_path.stem + ".msh")
             try:
-                create_volume(stl_path, out_path)
-                print(f"Processed {stl_path} -> {out_path}")
+                if args.format == "step":
+                    create_volume_step(in_path, out_path)
+                else:
+                    create_volume_stl(in_path, out_path)
+                print(f"Processed {in_path} -> {out_path}")
                 success_count += 1
             except Exception:
-                print(f"Failed to process {stl_path}")
+                print(f"Failed to process {in_path}")
                 fail_count += 1
                 gmsh.finalize()
                 gmsh.initialize()

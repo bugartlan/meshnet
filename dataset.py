@@ -50,6 +50,7 @@ def parse_args():
     p.add_argument(
         "--out", type=str, default=None, help="Optional explicit output .pt path."
     )
+    p.add_argument("--debug", action="store_true", help="Enable debug mode.")
     return p.parse_args()
 
 
@@ -59,6 +60,7 @@ def make_graphs(
     points: np.ndarray,
     stl: str,
     msh: str,
+    debug: bool = False,
 ):
     """Generate n graphs from given contact points on one given mesh."""
     graphs = []
@@ -68,7 +70,7 @@ def make_graphs(
         domain, stresses_vm = fea(
             contacts,
             contact_radius=2.0,
-            debug=False,
+            debug=debug,
             filename_stl=stl,
             filename_msh=msh,
         )
@@ -101,7 +103,9 @@ def main():
 
         # Load mesh and generate dataset
         mesh = trimesh.load_mesh(stl)
-        points, face_ids = trimesh.sample.sample_surface(mesh, count=n_samples)
+        points, face_ids = trimesh.sample.sample_surface(
+            mesh, count=n_samples, seed=args.seed
+        )
         points = points.reshape(args.num_samples, args.num_contacts, 3)
 
         forces = rng.uniform(
@@ -111,7 +115,7 @@ def main():
         )
 
         mesh_mio = meshio.read(msh)
-        graphs = make_graphs(mesh_mio, forces, points, stl=stl, msh=msh)
+        graphs = make_graphs(mesh_mio, forces, points, stl, msh, debug=args.debug)
         data.extend(graphs)
 
         print(f"Generated {len(graphs)} graphs for {name}.")
