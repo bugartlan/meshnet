@@ -58,7 +58,7 @@ def visualize(
     plotter.add_mesh(
         pv_mesh,
         scalars="VonMisesStress",
-        point_size=5,
+        point_size=1,
         render_points_as_spheres=True,
         show_edges=True,
     )
@@ -69,7 +69,7 @@ def visualize(
             arrow = pyvista.Arrow(
                 start=np.asarray(coord),
                 direction=force,
-                scale=2.0,
+                scale=0.001,
             )
             plotter.add_mesh(arrow, color="red")
 

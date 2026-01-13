@@ -63,10 +63,13 @@ def find_contact_patches(
 def build_graph(
     mesh: meshio.Mesh,
     y: np.ndarray,
+    radius: float = 1.0,
     contacts: list[tuple] | None = None,
 ) -> Data:
     # Node feature matrix with shape [num_nodes, num_node_features]
-    x = make_nodes(mesh, find_contact_patches(mesh, r=2.0, contacts=contacts), contacts)
+    x = make_nodes(
+        mesh, find_contact_patches(mesh, r=radius, contacts=contacts), contacts
+    )
     y = torch.tensor(y, dtype=torch.float32)
     edge_index, edge_attr = make_edges(mesh)
 

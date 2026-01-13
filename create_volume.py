@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 
 import gmsh
+import meshio
 
 DOMAIN_TAG = 1
 BOUNDARY_TAG = 2
@@ -79,23 +80,22 @@ def create_volume_step(step_path: Path, out_path: Path, debug: bool = False):
 
     # Check the model only consists of one volume
     volumes = gmsh.model.getEntities(3)
+    vol_tag = volumes[0][1]
+
     if len(volumes) != 1:
         raise RuntimeError("STEP file must contain exactly one volume entity.")
 
-    x0, y0, z0, x1, y1, z1 = gmsh.model.occ.getBoundingBox(3, 1)
+    x0, y0, z0, x1, y1, z1 = gmsh.model.occ.getBoundingBox(3, vol_tag)
     dx = x1 - x0
     dy = y1 - y0
     dz = z1 - z0
     max_dim = max(dx, dy, dz)
     scale = TARGET_SIZE / max_dim
 
-    com = gmsh.model.occ.getCenterOfMass(3, 1)
+    com = gmsh.model.occ.getCenterOfMass(3, vol_tag)
     gmsh.model.occ.translate(volumes, -com[0], -com[1], -com[2])
     gmsh.model.occ.synchronize()
     gmsh.model.occ.dilate(volumes, 0.0, 0.0, 0.0, scale, scale, scale)
-    gmsh.model.occ.synchronize()
-    x0, y0, z0, x1, y1, z1 = gmsh.model.occ.getBoundingBox(3, 1)
-    gmsh.model.occ.translate(volumes, 0, 0, -z0)
     gmsh.model.occ.synchronize()
 
     vol_tags = [v[1] for v in volumes]
@@ -108,11 +108,12 @@ def create_volume_step(step_path: Path, out_path: Path, debug: bool = False):
     gmsh.model.mesh.generate(3)
 
     if debug:
-        x0, y0, z0, x1, y1, z1 = gmsh.model.occ.getBoundingBox(3, 1)
+        x0, y0, z0, x1, y1, z1 = gmsh.model.occ.getBoundingBox(3, vol_tag)
         dx = x1 - x0
         dy = y1 - y0
         dz = z1 - z0
         max_dim = max(dx, dy, dz)
+        print(f"Bounding box: ({x0}, {y0}, {z0}) - ({x1}, {y1}, {z1})")
         print(f"Post-scale max dimension: {max_dim}")
 
         node_tags, _, _ = gmsh.model.mesh.getNodes()
@@ -126,7 +127,15 @@ def create_volume_step(step_path: Path, out_path: Path, debug: bool = False):
     gmsh.write(str(out_path))
 
 
-L = 0.005  # Characteristic length for mesh elements
+def post_process(mesh: meshio.Mesh):
+    """Translate the mesh so that the bottom of the bounding box is at z=0."""
+    z_coords = mesh.points[:, 2]
+    z_min = z_coords.min()
+    mesh.points[:, 2] -= z_min
+    return mesh
+
+
+L = 0.002  # Characteristic length for mesh elements
 
 
 def main():
@@ -145,6 +154,9 @@ def main():
             create_volume_stl(in_path, out_path)
         else:
             create_volume_step(in_path, out_path, debug=True)
+            mesh = meshio.read(out_path)
+            mesh = post_process(mesh)
+            meshio.gmsh.write(out_path, mesh, fmt_version="2.2", binary=False)
     else:
         args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -155,6 +167,9 @@ def main():
             try:
                 if args.format == "step":
                     create_volume_step(in_path, out_path)
+                    mesh = meshio.read(out_path)
+                    mesh = post_process(mesh)
+                    meshio.gmsh.write(out_path, mesh, fmt_version="2.2", binary=False)
                 else:
                     create_volume_stl(in_path, out_path)
                 print(f"Processed {in_path} -> {out_path}")

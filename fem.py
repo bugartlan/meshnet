@@ -1,3 +1,4 @@
+import meshio
 import numpy as np
 import pyvista
 import trimesh
@@ -6,6 +7,8 @@ from dolfinx import default_scalar_type, fem, geometry, mesh, plot
 from dolfinx.fem.petsc import LinearProblem
 from dolfinx.io import gmshio
 from mpi4py import MPI
+
+from utils import msh_to_trimesh
 
 ################################ Material Properties ###################################
 E = 2.0e9  # Young's modulus
@@ -40,7 +43,7 @@ def make_contact_patch(object_mesh, query, fdim, domain, x0, r, n, tag=1):
         )
         n_smooth /= np.linalg.norm(n_smooth, axis=1, keepdims=True)
         return (np.linalg.norm(x.T - x0, axis=1) < r) & (
-            np.dot(n_smooth, n).reshape(-1) > 0.7
+            np.dot(n_smooth, n).reshape(-1) > 0.5
         )
 
     candidate_facets = mesh.locate_entities_boundary(domain, fdim, contact)
@@ -67,7 +70,7 @@ def visualize_contact(domain, facet_tags, points=None):
     plotter.add_mesh(facet_grid, opacity=1, show_edges=True, line_width=0.1)
 
     if points is not None:
-        sphere = pyvista.Sphere(radius=0.01)
+        sphere = pyvista.Sphere(radius=0.001)
         for p in points:
             sph = sphere.translate(p, inplace=False)
             plotter.add_mesh(sph, color="red", opacity=1)
@@ -90,7 +93,6 @@ def is_root(x):
 def fea(
     loads: list[tuple],
     contact_radius: float = 2.0,
-    filename_stl: str = "cantilever.stl",
     filename_msh: str = "cantilever.msh",
     debug: bool = False,
 ):
@@ -105,7 +107,7 @@ def fea(
     v = ufl.TestFunction(V)
     fdim = domain.topology.dim - 1
 
-    object_mesh = trimesh.load(filename_stl)
+    object_mesh = msh_to_trimesh(meshio.read(filename_msh))
     query = trimesh.proximity.ProximityQuery(object_mesh)
 
     bottom_facets = mesh.locate_entities_boundary(domain, fdim, is_root)

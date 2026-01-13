@@ -163,7 +163,7 @@ def main():
         avg_loss = total_loss / total_nodes
         loss_history.append(avg_loss)
         if (epoch + 1) % 50 == 0:
-            print(f"Epoch {epoch + 1}/{args.num_epochs}, Loss: {avg_loss:.6f}")
+            tqdm.write(f"Epoch {epoch + 1}/{args.num_epochs}, Loss: {avg_loss:.6f}")
 
     torch.save(
         {

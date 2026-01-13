@@ -9,7 +9,9 @@ import trimesh
 
 from fem import eval, fea
 from graphs import build_graph
-from utils import info
+from utils import info, msh_to_trimesh
+
+R = 0.005
 
 
 def parse_args():
@@ -58,8 +60,8 @@ def make_graphs(
     mesh: meshio.Mesh,
     f: np.ndarray,
     points: np.ndarray,
-    stl: str,
     msh: str,
+    radius: float = 1.0,
     debug: bool = False,
 ):
     """Generate n graphs from given contact points on one given mesh."""
@@ -69,22 +71,28 @@ def make_graphs(
 
         domain, stresses_vm = fea(
             contacts,
-            contact_radius=2.0,
+            contact_radius=radius,
             debug=debug,
-            filename_stl=stl,
             filename_msh=msh,
         )
         y = eval(domain, stresses_vm, mesh.points)
-        graphs.append(build_graph(mesh, y, contacts))
+        graphs.append(build_graph(mesh, y, radius=radius, contacts=contacts))
 
     return graphs
+
+
+def shift(mesh: meshio.Mesh):
+    """Translate the mesh so that the bottom of the bounding box is at z=0."""
+    z_coords = mesh.points[:, 2]
+    z_min = z_coords.min()
+    mesh.points[:, 2] -= z_min
+    return mesh
 
 
 def main():
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    stl_path = Path("meshes") / args.dataset / "stl"
     msh_path = Path("meshes") / args.dataset / "msh"
 
     rng = np.random.default_rng(args.seed)
@@ -92,17 +100,17 @@ def main():
 
     n_samples = args.num_samples * args.num_contacts
     data = []
+    meshes = []
     for f in msh_path.glob("*.msh"):
         name = f.stem
-        stl = stl_path / f"{name}.stl"
         msh = msh_path / f"{name}.msh"
-        if not stl.exists():
-            raise FileNotFoundError(f"Missing STL: {stl}")
         if not msh.exists():
             raise FileNotFoundError(f"Missing MSH: {msh}")
 
         # Load mesh and generate dataset
-        mesh = trimesh.load_mesh(stl)
+        mesh_mio = meshio.read(msh)
+        mesh = msh_to_trimesh(mesh_mio)
+
         points, face_ids = trimesh.sample.sample_surface(
             mesh, count=n_samples, seed=args.seed
         )
@@ -114,9 +122,9 @@ def main():
             size=(args.num_samples, args.num_contacts, 3),
         )
 
-        mesh_mio = meshio.read(msh)
-        graphs = make_graphs(mesh_mio, forces, points, stl, msh, debug=args.debug)
+        graphs = make_graphs(mesh_mio, forces, points, msh, radius=R, debug=args.debug)
         data.extend(graphs)
+        meshes.extend([name] * len(graphs))
 
         print(f"Generated {len(graphs)} graphs for {name}.")
 
@@ -136,6 +144,7 @@ def main():
                 "output_dim": output_dim,
             },
             "graphs": data,
+            "meshes": meshes,
         },
         out_path,
     )
