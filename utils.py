@@ -69,7 +69,7 @@ def visualize(
             arrow = pyvista.Arrow(
                 start=np.asarray(coord),
                 direction=force,
-                scale=0.001,
+                scale=0.005,
             )
             plotter.add_mesh(arrow, color="red")
 

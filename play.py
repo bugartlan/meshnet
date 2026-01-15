@@ -2,27 +2,28 @@ import argparse
 from pathlib import Path
 
 import meshio
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 
 from nets import EncodeProcessDecode
-from utils import info, msh_to_trimesh, normalize, visualize
+from utils import msh_to_trimesh, normalize, visualize
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate trained model on a dataset.")
     p.add_argument(
-        "--model-path",
-        type=Path,
-        default=Path("models/model.pth"),
+        "--model",
+        type=str,
+        default="model",
         help="Path to the trained model file.",
     )
     p.add_argument(
         "--dataset",
-        type=Path,
-        default=Path("data/cantilever_1_10.pt"),
-        help="Path to the graph dataset file.",
+        type=str,
+        default="cantilever_1_10",
+        help="Path to the graph dataset file (no extension).",
     )
     p.add_argument(
         "--device",
@@ -37,21 +38,21 @@ def parse_args():
         help="Directory to save the visualization plots.",
     )
     p.add_argument(
+        "-N",
+        type=int,
+        default=1,
+        help="Number of samples to visualize from the dataset.",
+    )
+    p.add_argument(
         "--save-plots",
         action="store_true",
         help="Whether to save the visualization plots to the output directory.",
     )
     p.add_argument(
-        "--mesh-name",
-        type=str,
-        default="cantilever",
-        help="Base filename (without extension) for .stl and .msh files.",
-    )
-    p.add_argument(
         "--input-dir",
         type=Path,
         default=Path("meshes"),
-        help="Directory containing .stl and .msh.",
+        help="Directory containing .stl and .msh files.",
     )
     p.add_argument(
         "--weighted-loss",
@@ -70,27 +71,30 @@ def main():
     device = torch.device(args.device)
     print("Using device:", device)
 
-    graphs = torch.load(args.dataset, weights_only=False)
+    dataset_path = Path("data") / f"{args.dataset}.pt"
+    data = torch.load(dataset_path, weights_only=False)
+    graphs = data["graphs"]
+    meshes = data["meshes"]
+    params = data["params"]
 
-    latent_dim = 128
-    node_dim, edge_dim, output_dim = info(graphs[0], debug=True)
-
+    model_path = Path("models") / f"{args.model}.pth"
+    checkpoint = torch.load(
+        model_path, map_location=torch.device("cpu"), weights_only=True
+    )
+    model_state_dict = checkpoint["model_state_dict"]
+    params = checkpoint["params"]
+    stats = checkpoint["stats"]
     model = EncodeProcessDecode(
-        node_dim=node_dim,
-        edge_dim=edge_dim,
-        output_dim=output_dim,
-        latent_dim=latent_dim,
+        node_dim=params["node_dim"],
+        edge_dim=params["edge_dim"],
+        output_dim=params["output_dim"],
+        latent_dim=params["latent_dim"],
         message_passing_steps=15,
         use_layer_norm=True,
     ).to(device)
-
-    checkpoint = torch.load(
-        args.model_path, map_location=torch.device("cpu"), weights_only=True
-    )
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(model_state_dict)
     model.eval()
 
-    stats = checkpoint["stats"]
     loader = DataLoader(
         [normalize(g, stats) for g in graphs], batch_size=1, shuffle=False
     )
@@ -121,22 +125,24 @@ def main():
     print(f"Average MSE Loss over dataset: {avg_loss:.6f}")
 
     if args.save_plots:
-        mesh = msh_to_trimesh(meshio.read("meshes/cantilever.msh"))
-        for i, g in enumerate(graphs):
-            g_pred = g.clone()
-            g_pred.y = model(normalize(g, stats).to(device)).detach()
-            g_pred.y = g_pred.y * stats["y_std"].to(device) + stats["y_mean"].to(device)
-
+        rng = np.random.default_rng(42)
+        idx = rng.choice(len(graphs), size=args.N, replace=False)
+        for i in range(args.N):
+            msh_path = args.input_dir / "msh" / f"{meshes[idx[i]]}.msh"
+            mesh = msh_to_trimesh(meshio.read(msh_path))
+            g = graphs[idx[i]].clone()
+            g.y = model(normalize(g, stats).to(device)).detach()
+            g.y = g.y * stats["y_std"].to(device) + stats["y_mean"].to(device)
             visualize(
                 mesh,
-                g,
+                graphs[idx[i]],
                 force_arrows=True,
                 show=False,
                 filename=args.output_dir / f"truth_{i}.html",
             )
             visualize(
                 mesh,
-                g_pred,
+                g,
                 force_arrows=True,
                 show=False,
                 filename=args.output_dir / f"pred_{i}.html",
