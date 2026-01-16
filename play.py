@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 
 from nets import EncodeProcessDecode
-from utils import msh_to_trimesh, normalize, visualize
+from utils import make_pv_mesh, msh_to_trimesh, normalize, visualize_graph
 
 
 def parse_args():
@@ -51,7 +51,7 @@ def parse_args():
     p.add_argument(
         "--input-dir",
         type=Path,
-        default=Path("meshes"),
+        default=Path("meshes/cantilever"),
         help="Directory containing .stl and .msh files.",
     )
     p.add_argument(
@@ -60,6 +60,9 @@ def parse_args():
         help="Whether to use weighted MSE loss based on node positions.",
     )
     return p.parse_args()
+
+
+labels = ["x-displacement", "y-displacement", "z-displacement", "Von Mises Stress"]
 
 
 def main():
@@ -133,20 +136,30 @@ def main():
             g = graphs[idx[i]].clone()
             g.y = model(normalize(g, stats).to(device)).detach()
             g.y = g.y * stats["y_std"].to(device) + stats["y_mean"].to(device)
-            visualize(
-                mesh,
-                graphs[idx[i]],
-                force_arrows=True,
-                show=False,
-                filename=args.output_dir / f"truth_{i}.html",
-            )
-            visualize(
-                mesh,
-                g,
-                force_arrows=True,
-                show=False,
-                filename=args.output_dir / f"pred_{i}.html",
-            )
+            pv_mesh_truth = make_pv_mesh(mesh, graphs[idx[i]], labels)
+            pv_mesh_pred = make_pv_mesh(mesh, g, labels)
+            for j in range(3):
+                clim = (pv_mesh_truth[labels[j]].min(), pv_mesh_truth[labels[j]].max())
+                visualize_graph(
+                    pv_mesh_truth,
+                    g,
+                    label=labels[j],
+                    show=False,
+                    force_arrows=True,
+                    clim=clim,
+                    filename=args.output_dir
+                    / f"{meshes[idx[i]]}_sample{i}_true_{labels[j].replace(' ', '_')}.html",
+                )
+                visualize_graph(
+                    pv_mesh_pred,
+                    g,
+                    label=labels[j],
+                    show=False,
+                    force_arrows=True,
+                    clim=clim,
+                    filename=args.output_dir
+                    / f"{meshes[idx[i]]}_sample{i}_pred_{labels[j].replace(' ', '_')}.html",
+                )
 
 
 if __name__ == "__main__":

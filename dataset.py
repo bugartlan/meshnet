@@ -11,15 +11,14 @@ from fem import eval, fea
 from graphs import build_graph
 from utils import info, msh_to_trimesh
 
-R = 0.005
+R = 0.0025
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Generate dataset from meshes.")
     p.add_argument(
-        "--dataset",
+        "name",
         type=str,
-        default="cantilever",
         help="Name of the dataset of meshes.",
     )
     p.add_argument(
@@ -61,22 +60,20 @@ def make_graphs(
     f: np.ndarray,
     points: np.ndarray,
     msh: str,
-    radius: float = 1.0,
     debug: bool = False,
 ):
     """Generate n graphs from given contact points on one given mesh."""
     graphs = []
     for p, f_vec in zip(points, f):
         contacts = list(zip(p, f_vec))
-
-        domain, stresses_vm = fea(
+        domain, stresses_vm, uh = fea(
             contacts,
-            contact_radius=radius,
+            contact_radius=R,
             debug=debug,
             filename_msh=msh,
         )
-        y = eval(domain, stresses_vm, mesh.points)
-        graphs.append(build_graph(mesh, y, radius=radius, contacts=contacts))
+        y = eval(domain, [uh, stresses_vm], mesh.points)
+        graphs.append(build_graph(mesh, y, radius=R, contacts=contacts))
 
     return graphs
 
@@ -93,7 +90,7 @@ def main():
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    msh_path = Path("meshes") / args.dataset / "msh"
+    msh_path = Path("meshes") / args.name / "msh"
 
     rng = np.random.default_rng(args.seed)
     start = time.time()
@@ -122,7 +119,7 @@ def main():
             size=(args.num_samples, args.num_contacts, 3),
         )
 
-        graphs = make_graphs(mesh_mio, forces, points, msh, radius=R, debug=args.debug)
+        graphs = make_graphs(mesh_mio, forces, points, msh, debug=args.debug)
         data.extend(graphs)
         meshes.extend([name] * len(graphs))
 
@@ -131,8 +128,7 @@ def main():
     out_path = (
         args.out
         if args.out is not None
-        else args.output_dir
-        / f"{args.dataset}_{args.num_contacts}_{args.num_samples}.pt"
+        else args.output_dir / f"{args.name}_{args.num_contacts}_{args.num_samples}.pt"
     )
 
     node_dim, edge_dim, output_dim = info(data[0], debug=False)

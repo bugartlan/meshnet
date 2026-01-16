@@ -37,27 +37,84 @@ def find_contacts(graph: Data) -> dict[np.ndarray, np.ndarray]:
     return forces
 
 
+def make_pv_mesh(mesh: trimesh.Trimesh, graph: Data, labels: list) -> pyvista.PolyData:
+    pv_mesh = pyvista.wrap(mesh)
+    tree = cKDTree(mesh.vertices)
+    _, idx = tree.query(mesh.vertices)
+    for i, label in enumerate(labels):
+        values = graph.y[:, i].cpu().numpy().squeeze()
+        values_mesh = values[idx]
+        pv_mesh[label] = values_mesh
+    return pv_mesh
+
+
+def visualize_graph(
+    pv_mesh: pyvista.PolyData,
+    graph: Data,
+    label: str,
+    jupyter_backend: str = None,
+    force_arrows: bool = False,
+    show: bool = True,
+    filename: str = None,
+    clim: tuple = None,
+):
+    x_min, x_max, y_min, y_max, z_min, z_max = pv_mesh.bounds
+    scale = max(x_max - x_min, y_max - y_min, z_max - z_min) * 0.1
+
+    plotter = pyvista.Plotter(notebook=jupyter_backend is not None)
+    if label not in pv_mesh.array_names:
+        raise ValueError(f"Label '{label}' not found in mesh array names.")
+
+    plotter.add_mesh(
+        pv_mesh,
+        scalars=label,
+        point_size=1,
+        render_points_as_spheres=True,
+        show_edges=True,
+        clim=clim,
+    )
+
+    if force_arrows:
+        forces = find_contacts(graph)
+        for coord, force in forces.items():
+            arrow = pyvista.Arrow(
+                start=np.asarray(coord),
+                direction=force,
+                scale=scale,
+            )
+            plotter.add_mesh(arrow, color="red")
+
+    plotter.show_axes()
+    if show:
+        plotter.show(jupyter_backend=jupyter_backend)
+    if filename is not None:
+        plotter.export_html(filename)
+
+
 def visualize(
     mesh: trimesh.Trimesh,
     graph: Data,
+    v_idx: int = 0,
+    label: str = "VonMisesStress",
     jupyter_backend: str = None,
     force_arrows=False,
     show: bool = True,
     filename: str = None,
 ):
-    stress = graph.y[:, 0].cpu().numpy().squeeze()
+    values = graph.y[:, v_idx].cpu().numpy().squeeze()
 
     tree = cKDTree(mesh.vertices)
     _, idx = tree.query(mesh.vertices)
 
-    stress_mesh = stress[idx]
+    values_mesh = values[idx]
     pv_mesh = pyvista.wrap(mesh)
-    pv_mesh["VonMisesStress"] = stress_mesh
+    pv_mesh[label] = values_mesh
 
+    scale = mesh.extents.max() * 0.1
     plotter = pyvista.Plotter(notebook=jupyter_backend is not None)
     plotter.add_mesh(
         pv_mesh,
-        scalars="VonMisesStress",
+        scalars=label,
         point_size=1,
         render_points_as_spheres=True,
         show_edges=True,
@@ -69,7 +126,7 @@ def visualize(
             arrow = pyvista.Arrow(
                 start=np.asarray(coord),
                 direction=force,
-                scale=0.005,
+                scale=scale,
             )
             plotter.add_mesh(arrow, color="red")
 

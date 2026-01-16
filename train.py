@@ -21,7 +21,7 @@ def parse_args():
         help="Directory to save the trained model file.",
     )
     p.add_argument(
-        "--filename",
+        "--out",
         type=str,
         default="model",
         help="Filename for the trained model file.",
@@ -88,6 +88,9 @@ def parse_args():
 
 
 latent_dim = 128
+DISPLACEMENT = list(range(3))
+STRESS = 3
+ALL = DISPLACEMENT + [STRESS]
 
 
 def main():
@@ -148,11 +151,11 @@ def main():
             batch = batch.to(device)
             optimizer.zero_grad()
 
-            y_pred = model(batch)
-            y_true = batch.y
+            y_pred = model(batch)[:, DISPLACEMENT]
+            y_true = batch.y[:, DISPLACEMENT]
 
             weight = torch.exp(-alpha * batch.x[:, 2].unsqueeze(1))
-            weight = weight / weight.mean()
+            weight = (weight / weight.mean()).broadcast_to(y_true.shape)
 
             loss = F.mse_loss(y_pred, y_true, weight=weight)
             loss.backward()
@@ -178,7 +181,7 @@ def main():
             },
             "stats": stats,
         },
-        args.output_dir / f"{args.filename}.pth",
+        args.output_dir / f"{args.out}.pth",
     )
 
     end = time.time()

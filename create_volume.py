@@ -4,9 +4,12 @@ from pathlib import Path
 
 import gmsh
 import meshio
+import trimesh
 
 DOMAIN_TAG = 1
 BOUNDARY_TAG = 2
+
+TARGET_SIZE = 0.05  # (m)
 
 
 def parse_args():
@@ -38,11 +41,21 @@ def parse_args():
     return p.parse_args()
 
 
+def scale_stl_mesh(stl_path: Path, target_size: float):
+    mesh = trimesh.load(str(stl_path))
+    scale = target_size / mesh.extents.max()
+    mesh.apply_scale(scale)
+    out_path = stl_path.parent / (stl_path.stem + "_scaled.stl")
+    mesh.export(str(out_path))
+    return out_path
+
+
 def create_volume_stl(stl_path: Path, out_path: Path):
+    scaled_stl_path = scale_stl_mesh(stl_path, TARGET_SIZE)
     gmsh.clear()
 
     gmsh.model.add("mesh_volume")
-    gmsh.merge(str(stl_path))
+    gmsh.merge(str(scaled_stl_path))
     gmsh.model.geo.removeAllDuplicates()
 
     angle_threshold = 45  # degrees
@@ -66,9 +79,6 @@ def create_volume_stl(stl_path: Path, out_path: Path):
     gmsh.model.mesh.generate(3)
 
     gmsh.write(str(out_path))
-
-
-TARGET_SIZE = 0.05  # (m)
 
 
 def create_volume_step(step_path: Path, out_path: Path, debug: bool = False):
@@ -135,7 +145,7 @@ def post_process(mesh: meshio.Mesh):
     return mesh
 
 
-L = 0.002  # Characteristic length for mesh elements
+L = TARGET_SIZE / 20  # Characteristic length for mesh elements
 
 
 def main():

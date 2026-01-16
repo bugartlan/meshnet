@@ -17,6 +17,8 @@ lambda_ = E * nu / ((1 + nu) * (1 - 2 * nu))
 mu = E / (2 * (1 + nu))
 #########################################################################################
 
+ROOT_TOLERANCE = 1e-4
+
 
 def epsilon(u):
     return ufl.sym(ufl.grad(u))
@@ -180,11 +182,24 @@ def fea(
         warped_grid.cell_data["VonMises"] = stresses_vm.x.petsc_vec.array
         visualize_stress(warped_grid)
 
-    return domain, stresses_vm
+    return domain, stresses_vm, uh
 
 
-def eval(domain, func, points):
+def eval(domain, funcs, points):
+    """
+    Evaluate a list of functions at given points inside the domain.
+
+    Args:
+        domain: The dolfinx mesh/domain.
+        funcs: A list of Functions to evaluate.
+        points: (N, 3) array of points where to evaluate the functions.
+
+    Returns:
+        A (N, d) array of evaluated function values, where d is the sum of the dimensions of the function outputs.
+    """
     points = np.asarray(points)
+
+    # Build bounding box tree and find colliding cells
     tree = geometry.bb_tree(domain, domain.topology.dim)
     candidates = geometry.compute_collisions_points(tree, points)
     colliding_cells = geometry.compute_colliding_cells(domain, candidates, points)
@@ -194,26 +209,29 @@ def eval(domain, func, points):
     for i in range(points.shape[0]):
         cell_ids = colliding_cells.links(i)
         if len(cell_ids) > 0:
+            # Point is inside the domain; may belong to multiple cells (e.g. boundary)
             for cid in cell_ids:
                 eval_point_indices.append(i)
                 eval_cell_ids.append(cid)
 
+    # No points found inside the domain
     if len(eval_point_indices) == 0:
         return np.zeros((0,), dtype=np.float64)
 
-    raw_values = func.eval(points[eval_point_indices], eval_cell_ids)
-    accumulated_values = np.zeros(
-        (points.shape[0], raw_values.shape[1]), dtype=raw_values.dtype
-    )
     counts = np.zeros((points.shape[0], 1), dtype=np.int32)
-
-    np.add.at(accumulated_values, eval_point_indices, raw_values)
     np.add.at(counts, eval_point_indices, 1)
+    mask_found = counts.flatten() > 0
 
-    mask_found = counts > 0
-    accumulated_values[mask_found] /= counts[mask_found]
+    results = []
+    for func in funcs:
+        raw_values = func.eval(points[eval_point_indices], eval_cell_ids)
+        dim = raw_values.shape[1]
+        accumulated_values = np.zeros((points.shape[0], dim), dtype=raw_values.dtype)
+        np.add.at(accumulated_values, eval_point_indices, raw_values)
+        accumulated_values[mask_found] /= counts[mask_found]
+        results.append(accumulated_values[mask_found])
 
-    return accumulated_values[mask_found].reshape(-1, 1)
+    return np.hstack(results)
 
 
 def eval_dg0(domain, func, points):
