@@ -9,11 +9,13 @@ from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
 from nets import EncodeProcessDecode
-from utils import normalize
+from utils import get_weight, normalize
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate trained model on a dataset.")
+
+    # --- IO Configuration ---
     p.add_argument(
         "--output-dir",
         type=Path,
@@ -21,9 +23,9 @@ def parse_args():
         help="Directory to save the trained model file.",
     )
     p.add_argument(
-        "--out",
+        "--model-name",
         type=str,
-        default="model",
+        default=None,
         help="Filename for the trained model file.",
     )
     p.add_argument(
@@ -32,6 +34,38 @@ def parse_args():
         default="cantilever_1_10",
         help="Name of the graph dataset file (without extension).",
     )
+
+    # --- Training Configuration ---
+    p.add_argument(
+        "--weighted-loss",
+        action="store_true",
+        help="Whether to use weighted MSE loss based on distance to the bottom.",
+    )
+    p.add_argument(
+        "--target",
+        choices=["all", "displacement", "stress"],
+        default="stress",
+        help="Which components to include in the loss calculation.",
+    )
+    p.add_argument(
+        "--alpha",
+        type=float,
+        default=0.1,
+        help="Exponential scaling factor (only used if --weight-mode='weighted').",
+    )
+
+    # --- Training Hyperparameters ---
+    p.add_argument("--num-epochs", type=int, default=100)
+    p.add_argument("--learning-rate", type=float, default=1e-5)
+    p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument(
+        "--layers",
+        type=int,
+        default=15,
+        help="Number of message passing steps in the model.",
+    )
+
+    # --- Runtime Flags ---
     p.add_argument(
         "--device",
         type=str,
@@ -41,56 +75,19 @@ def parse_args():
     p.add_argument(
         "--plots",
         action="store_true",
-        default=True,
         help="Whether to show the training loss plot.",
-    )
-    p.add_argument(
-        "--weighted-loss",
-        action="store_true",
-        help="Whether to use weighted MSE loss based on distance to the bottom.",
-    )
-    p.add_argument(
-        "--alpha",
-        type=float,
-        default=0.1,
-        help="Exponential scaling factor for weighted MSE loss.",
-    )
-    p.add_argument(
-        "--num-epochs",
-        type=int,
-        default=500,
-        help="Number of training epochs.",
-    )
-    p.add_argument(
-        "--learning-rate",
-        type=float,
-        default=1e-5,
-        help="Learning rate for the optimizer.",
-    )
-    p.add_argument(
-        "--batch-size",
-        type=int,
-        default=1,
-        help="Batch size for training.",
-    )
-    p.add_argument(
-        "--message-passing-steps",
-        type=int,
-        default=15,
-        help="Number of message passing steps in the model.",
     )
     p.add_argument(
         "--debug",
         action="store_true",
         help="Whether to print debug information.",
     )
+
     return p.parse_args()
 
 
 latent_dim = 128
-DISPLACEMENT = list(range(3))
-STRESS = 3
-ALL = DISPLACEMENT + [STRESS]
+USE_LAYER_NORM = True
 
 
 def main():
@@ -126,8 +123,8 @@ def main():
         edge_dim=data["params"]["edge_dim"],
         output_dim=data["params"]["output_dim"],
         latent_dim=latent_dim,
-        message_passing_steps=args.message_passing_steps,
-        use_layer_norm=True,
+        message_passing_steps=args.layers,
+        use_layer_norm=USE_LAYER_NORM,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
@@ -137,7 +134,18 @@ def main():
             print(f"{name}: {param.dtype}, shape: {param.shape}")
 
     # Exponential scaling factor for mse loss
-    alpha = 0.1 if args.weighted_loss else 0.0
+    alpha = args.alpha
+    mode = "weighted" if args.weighted_loss else "all"
+
+    # Loss targets
+    if args.target == "all":
+        target_indices = list(range(4))
+    elif args.target == "displacement":
+        target_indices = list(range(3))
+    elif args.target == "stress":
+        target_indices = [3]
+    else:
+        raise ValueError(f"Unknown target: {args.target}")
 
     loss_history = []
     start = time.time()
@@ -151,12 +159,10 @@ def main():
             batch = batch.to(device)
             optimizer.zero_grad()
 
-            y_pred = model(batch)[:, DISPLACEMENT]
-            y_true = batch.y[:, DISPLACEMENT]
+            y_pred = model(batch)[:, target_indices]
+            y_true = batch.y[:, target_indices]
 
-            weight = torch.exp(-alpha * batch.x[:, 2].unsqueeze(1))
-            weight = (weight / weight.mean()).broadcast_to(y_true.shape)
-
+            weight = get_weight(batch.x[:, 2], y_true.shape[1], mode=mode, alpha=alpha)
             loss = F.mse_loss(y_pred, y_true, weight=weight)
             loss.backward()
             optimizer.step()
@@ -168,6 +174,13 @@ def main():
         if (epoch + 1) % 50 == 0:
             tqdm.write(f"Epoch {epoch + 1}/{args.num_epochs}, Loss: {avg_loss:.6f}")
 
+    if args.model_name:
+        model_name = args.model_name
+    else:
+        model_name = (
+            f"{args.dataset}_{args.target}_{'w' if args.weighted_loss else 'uw'}"
+        )
+
     torch.save(
         {
             "model_state_dict": model.state_dict(),
@@ -176,12 +189,17 @@ def main():
                 "edge_dim": data["params"]["edge_dim"],
                 "output_dim": data["params"]["output_dim"],
                 "latent_dim": latent_dim,
-                "message_passing_steps": args.message_passing_steps,
-                "use_layer_norm": True,
+                "message_passing_steps": args.layers,
+                "use_layer_norm": USE_LAYER_NORM,
             },
             "stats": stats,
+            "training_args": {
+                "num_epochs": args.num_epochs,
+                "learning_rate": args.learning_rate,
+                "batch_size": args.batch_size,
+            },
         },
-        args.output_dir / f"{args.out}.pth",
+        args.output_dir / f"{model_name}.pth",
     )
 
     end = time.time()

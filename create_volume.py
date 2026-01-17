@@ -137,11 +137,9 @@ def create_volume_step(step_path: Path, out_path: Path, debug: bool = False):
     gmsh.write(str(out_path))
 
 
-def post_process(mesh: meshio.Mesh):
+def normalize_z(mesh: meshio.Mesh):
     """Translate the mesh so that the bottom of the bounding box is at z=0."""
-    z_coords = mesh.points[:, 2]
-    z_min = z_coords.min()
-    mesh.points[:, 2] -= z_min
+    mesh.points[:, 2] -= mesh.points[:, 2].min()
     return mesh
 
 
@@ -165,7 +163,7 @@ def main():
         else:
             create_volume_step(in_path, out_path, debug=True)
             mesh = meshio.read(out_path)
-            mesh = post_process(mesh)
+            mesh = normalize_z(mesh)
             meshio.gmsh.write(out_path, mesh, fmt_version="2.2", binary=False)
     else:
         args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -178,7 +176,7 @@ def main():
                 if args.format == "step":
                     create_volume_step(in_path, out_path)
                     mesh = meshio.read(out_path)
-                    mesh = post_process(mesh)
+                    mesh = normalize_z(mesh)
                     meshio.gmsh.write(out_path, mesh, fmt_version="2.2", binary=False)
                 else:
                     create_volume_stl(in_path, out_path)
