@@ -150,6 +150,9 @@ def main():
     loss_history = []
     start = time.time()
 
+    # Mixed precision training scaler
+    scaler = torch.amp.GradScaler()
+
     for epoch in tqdm(range(args.num_epochs)):
         model.train()
         total_loss = 0.0
@@ -159,16 +162,19 @@ def main():
             batch = batch.to(device)
             optimizer.zero_grad()
 
-            y_pred = model(batch)[:, target_indices]
             y_true = batch.y[:, target_indices]
-
             weight = get_weight(batch.x[:, 2], y_true.shape[1], mode=mode, alpha=alpha)
-            loss = F.mse_loss(y_pred, y_true, weight=weight)
-            loss.backward()
-            optimizer.step()
+            with torch.autocast(device_type=args.device, dtype=torch.float16):
+                y_pred = model(batch)[:, target_indices]
+                loss = F.mse_loss(y_pred, y_true, weight=weight)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             total_loss += loss.item() * batch.num_nodes
             total_nodes += batch.num_nodes
+
         avg_loss = total_loss / total_nodes
         loss_history.append(avg_loss)
         if (epoch + 1) % 50 == 0:
