@@ -8,7 +8,19 @@ import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 
 from nets import EncodeProcessDecode
-from utils import get_weight, make_pv_mesh, msh_to_trimesh, normalize, visualize_graph
+from utils import (
+    get_weight,
+    make_pv_mesh,
+    msh_to_trimesh,
+    normalize,
+    strain_stress_vm,
+    visualize_graph,
+)
+
+################################ Material Properties ###################################
+E = 2.0e9  # Young's modulus
+nu = 0.35  # Poisson's ratio
+#########################################################################################
 
 
 def parse_args():
@@ -36,6 +48,11 @@ def parse_args():
 
     # --- Evaluation Configuration ---
     p.add_argument("--mode", choices=["all", "weighted", "bottom"], default="all")
+    p.add_argument(
+        "--compute_stress",
+        action="store_true",
+        help="If set, compute von Mises stress from the predicted displacement.",
+    )
     p.add_argument(
         "--target",
         choices=["all", "displacement", "stress"],
@@ -91,7 +108,7 @@ def main():
 
     dataset_path = Path("data") / f"{args.dataset}.pt"
     data = torch.load(dataset_path, weights_only=False)
-    graphs = data["graphs"]
+    graphs = [g.to(device) for g in data["graphs"]]
     meshes = data["meshes"]
 
     model_path = Path("models") / f"{args.checkpoint}.pth"
@@ -100,7 +117,7 @@ def main():
     )
     model_state_dict = checkpoint["model_state_dict"]
     params = checkpoint["params"]
-    stats = checkpoint["stats"]
+    stats = {k: v.to(device) for k, v in checkpoint["stats"].items()}
     model = EncodeProcessDecode(
         node_dim=params["node_dim"],
         edge_dim=params["edge_dim"],
@@ -111,10 +128,6 @@ def main():
     ).to(device)
     model.load_state_dict(model_state_dict)
     model.eval()
-
-    loader = DataLoader(
-        [normalize(g, stats) for g in graphs], batch_size=1, shuffle=False
-    )
 
     # Loss targets
     if args.target == "all":
@@ -129,70 +142,69 @@ def main():
     total_loss = 0.0
     total_nodes = 0
 
+    graphs_pred = []
     with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device)
+        for g in graphs:
+            normalized_g = normalize(g, stats)
 
-            y_pred = model(batch)[:, target_indices]
-            y_true = batch.y[:, target_indices]
+            y_pred = model(normalized_g)
+            y_pred = y_pred * stats["y_std"] + stats["y_mean"]
+
+            g_pred = g.clone()
+            g_pred.y = y_pred
+
+            if args.compute_stress:
+                eps, sigma, vm = strain_stress_vm(g_pred, E, nu)
+                g_pred.y[:, 3] = vm
+
+            graphs_pred.append(g_pred)
+
+            y_true = g.y[:, target_indices]
+            y_pred = g_pred.y[:, target_indices]
 
             weight = get_weight(
-                batch.x[:, 2],
+                g.x[:, 2],
                 y_true.shape[1],
                 mode=args.mode,
                 alpha=args.alpha,
             )
 
-            loss = F.mse_loss(y_pred, y_true, weight=weight)
+            loss = F.l1_loss(y_pred, y_true, weight=weight)
 
-            total_loss += loss.item() * batch.num_nodes
-            total_nodes += batch.num_nodes
+            total_loss += loss.item() * g.num_nodes
+            total_nodes += g.num_nodes
 
     avg_loss = total_loss / total_nodes
-    print(f"Average MSE Loss over dataset: {avg_loss:.6f}")
+    print(f"Average L1 Loss over dataset: {avg_loss:.6f}")
 
     if args.plots:
         print(f"Generating {args.n} plots in {args.plot_dir}...")
         rng = np.random.default_rng(42)
 
-        n_samples = min(args.n, len(graphs))
-        idx = rng.choice(len(graphs), size=n_samples, replace=False)
+        n_samples = min(args.n, len(graphs_pred))
+        idx = rng.choice(len(graphs_pred), size=n_samples, replace=False)
 
         for i in range(n_samples):
             mesh_name = meshes[idx[i]]
             msh_path = args.mesh_dir / "msh" / f"{mesh_name}.msh"
             mesh = msh_to_trimesh(meshio.read(msh_path))
 
-            g_true = graphs[idx[i]]
-            g_input = normalize(g_true, stats).to(device)
-
-            # Predict
-            with torch.no_grad():
-                pred_normalized = model(g_input)
-
-            # Denormalize predictions to get physical values
-            y_pred_phys = pred_normalized * stats["y_std"].to(device) + stats[
-                "y_mean"
-            ].to(device)
-
-            # Create graphs for visualization
-            g_pred = g_true.clone()
-            g_pred.y = y_pred_phys.cpu()
+            g_true = graphs[idx[i]].cpu()
+            g_pred = graphs_pred[idx[i]].cpu()
 
             pv_mesh_true = make_pv_mesh(mesh, g_true, labels)
             pv_mesh_pred = make_pv_mesh(mesh, g_pred, labels)
 
             for j in target_indices:
-                label_name = labels[j]
-                safe_label = label_name.replace(" ", "_")
+                label_name = labels[j].replace(" ", "_")
 
                 # Determine color limits based on true values
                 clim = (pv_mesh_true[labels[j]].min(), pv_mesh_true[labels[j]].max())
                 filename_true = (
-                    args.plot_dir / f"{mesh_name}_sample{i}_true_{safe_label}.html"
+                    args.plot_dir / f"{mesh_name}_sample{i}_true_{label_name}.html"
                 )
                 filename_pred = (
-                    args.plot_dir / f"{mesh_name}_sample{i}_pred_{safe_label}.html"
+                    args.plot_dir / f"{mesh_name}_sample{i}_pred_{label_name}.html"
                 )
 
                 # Plot ground truth and prediction
