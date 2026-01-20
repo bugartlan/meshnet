@@ -93,11 +93,19 @@ USE_LAYER_NORM = True
 def main():
     args = parse_args()
 
-    # Load dataset
-    dataset_path = Path("data") / f"{args.dataset}.pt"
-    data = torch.load(dataset_path, weights_only=False)
-    graphs = data["graphs"]
-
+    # Check if args.dataset is a file or a folder
+    # If it's a folder, then load every .pt file in the folder
+    dataset_path = Path("data") / args.dataset
+    if dataset_path.is_dir():
+        graphs = []
+        for pt_file in dataset_path.glob("*.pt"):
+            data = torch.load(pt_file, weights_only=False)
+            graphs.extend(data["graphs"])
+    else:
+        # Load dataset
+        dataset_path = Path("data") / f"{args.dataset}.pt"
+        data = torch.load(dataset_path, weights_only=False)
+        graphs = data["graphs"]
     device = torch.device(args.device)
     train_x = torch.cat([g.x for g in graphs], dim=0)
     train_y = torch.cat([g.y for g in graphs], dim=0)
@@ -152,6 +160,7 @@ def main():
 
     # Mixed precision training scaler
     scaler = torch.amp.GradScaler()
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.98)
 
     for epoch in tqdm(range(args.num_epochs)):
         model.train()
@@ -174,6 +183,8 @@ def main():
 
             total_loss += loss.item() * batch.num_nodes
             total_nodes += batch.num_nodes
+
+        scheduler.step()
 
         avg_loss = total_loss / total_nodes
         loss_history.append(avg_loss)

@@ -28,7 +28,6 @@ def sigma(u):
     return 2 * mu * epsilon(u) + lambda_ * ufl.tr(epsilon(u)) * ufl.Identity(len(u))
 
 
-# TODO: Cannot find contact patches when the meshes are sparse.
 def make_contact_patch(object_mesh, query, fdim, domain, x0, r, n, tag=1):
     """Tag boundary facets whose (sample) points lie within radius r of x0."""
 
@@ -92,7 +91,7 @@ def is_root(x):
     return np.isclose(x[2], 0.0, atol=1e-3)
 
 
-def fea(
+def solve(
     loads: list[tuple],
     contact_radius: float = 2.0,
     filename_msh: str = "cantilever.msh",
@@ -165,7 +164,9 @@ def fea(
     # Stress computation
     s_von_mises = sigma(uh) - 1.0 / 3 * ufl.tr(sigma(uh)) * ufl.Identity(len(uh))
     von_mises = ufl.sqrt(3 / 2 * ufl.inner(s_von_mises, s_von_mises))
-    V_von_mises = fem.functionspace(domain, ("DG", 0))
+    # ("DG, 0") for cell-wise constant stress
+    # ("CG, 1") for nodal stress
+    V_von_mises = fem.functionspace(domain, ("CG", 1))
     stress_expr_vm = fem.Expression(
         von_mises, V_von_mises.element.interpolation_points()
     )
@@ -185,7 +186,22 @@ def fea(
     return domain, stresses_vm, uh
 
 
-def eval(domain, funcs, points):
+def interp_pyvista(domain, funcs, points):
+    topology, cell_types, geometry = plot.vtk_mesh(domain, domain.topology.dim)
+    grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
+    n = grid.n_points
+
+    for i, func in enumerate(funcs):
+        data = func.x.array.reshape(n, -1)
+        grid.point_data[f"f{i}"] = data
+
+    cloud = pyvista.PolyData(points)
+    samples = cloud.sample(grid, tolerance=1e-5)
+
+    return np.column_stack([samples[f"f{i}"] for i in range(len(funcs))])
+
+
+def interp(domain, funcs, points):
     """
     Evaluate a list of functions at given points inside the domain.
 
@@ -198,6 +214,7 @@ def eval(domain, funcs, points):
         A (N, d) array of evaluated function values, where d is the sum of the dimensions of the function outputs.
     """
     points = np.asarray(points)
+    n_points = points.shape[0]
 
     # Build bounding box tree and find colliding cells
     tree = geometry.bb_tree(domain, domain.topology.dim)
@@ -206,13 +223,21 @@ def eval(domain, funcs, points):
 
     eval_point_indices = []
     eval_cell_ids = []
-    for i in range(points.shape[0]):
+
+    query_pts = points.copy()
+
+    found_mask = np.zeros(n_points, dtype=bool)
+
+    for i in range(n_points):
         cell_ids = colliding_cells.links(i)
         if len(cell_ids) > 0:
-            # Point is inside the domain; may belong to multiple cells (e.g. boundary)
+            found_mask[i] = True
             for cid in cell_ids:
+                # Point is inside the domain; may belong to multiple cells (e.g. boundary)
                 eval_point_indices.append(i)
                 eval_cell_ids.append(cid)
+        else:
+            print(f"Point {points[i]} not found inside the domain.")
 
     # No points found inside the domain
     if len(eval_point_indices) == 0:
@@ -224,7 +249,7 @@ def eval(domain, funcs, points):
 
     results = []
     for func in funcs:
-        raw_values = func.eval(points[eval_point_indices], eval_cell_ids)
+        raw_values = func.eval(query_pts[eval_point_indices], eval_cell_ids)
         dim = raw_values.shape[1]
         accumulated_values = np.zeros((points.shape[0], dim), dtype=raw_values.dtype)
         np.add.at(accumulated_values, eval_point_indices, raw_values)
@@ -260,4 +285,4 @@ if __name__ == "__main__":
         ((-10.0, 5.0, 25.0), np.array([-1.0, 0.0, 0.0])),
     ]
     query_pts = np.array([[0.0, 5.0, 25.0], [-10.0, 5.0, 25.0]])
-    domain, stresses_vm = fea(loads, contact_radius=2.0, debug=True)
+    domain, stresses_vm = solve(loads, contact_radius=2.0, debug=True)

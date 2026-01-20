@@ -109,7 +109,7 @@ def main():
     dataset_path = Path("data") / f"{args.dataset}.pt"
     data = torch.load(dataset_path, weights_only=False)
     graphs = [g.to(device) for g in data["graphs"]]
-    meshes = data["meshes"]
+    mesh_name = data["mesh"]
 
     model_path = Path("models") / f"{args.checkpoint}.pth"
     checkpoint = torch.load(
@@ -184,9 +184,14 @@ def main():
         n_samples = min(args.n, len(graphs_pred))
         idx = rng.choice(len(graphs_pred), size=n_samples, replace=False)
 
+        is_coarse = args.dataset.endswith("_c")
+
         for i in range(n_samples):
-            mesh_name = meshes[idx[i]]
-            msh_path = args.mesh_dir / "msh" / f"{mesh_name}.msh"
+            msh_path = (
+                args.mesh_dir
+                / ("msh_coarse" if is_coarse else "msh")
+                / f"{mesh_name}.msh"
+            )
             mesh = msh_to_trimesh(meshio.read(msh_path))
 
             g_true = graphs[idx[i]].cpu()

@@ -4,10 +4,10 @@ import pyvista
 import torch
 import trimesh
 from scipy.spatial import cKDTree
-from torch_geometric.data import Data, HeteroData
+from torch_geometric.data import Data
 
 
-def info(graph: HeteroData, debug=False):
+def info(graph: Data, debug=False):
     graph.validate(raise_on_error=True)
 
     node_dim = graph.num_node_features
@@ -192,6 +192,11 @@ def normalize(graph, stats):
     """
     Normalize graph features using provided statistics.
 
+    Normalizes node positions and edge attributes while preserving sparse force features
+    (indices 3-5) and the boundary indicator (last feature).
+
+    Normalize the relative positions using the mean and std of the world coordinates.
+
     Args:
         graph (Data): Input graph with x, y, and edge_attr attributes.
         stats (dict): Dictionary containing mean and std for x, y, and edge_attr.
@@ -203,9 +208,7 @@ def normalize(graph, stats):
     g = graph.clone()
     # Handle std = 0 case by replacing with 1 (skips normalization for constant features)
     x_std_safe = torch.where(
-        stats["x_std"][:-1] > 0,
-        stats["x_std"][:-1],
-        torch.ones_like(stats["x_std"][:-1]),
+        stats["x_std"] > 0, stats["x_std"], torch.ones_like(stats["x_std"])
     )
     y_std_safe = torch.where(
         stats["y_std"] > 0, stats["y_std"], torch.ones_like(stats["y_std"])
@@ -214,7 +217,12 @@ def normalize(graph, stats):
         stats["e_std"] > 0, stats["e_std"], torch.ones_like(stats["e_std"])
     )
 
-    g.x[:, :-1] = (g.x[:, :-1] - stats["x_mean"][:-1]) / x_std_safe
+    # Normalize node features (excluding last feature)
+    mask = torch.ones(g.x.size(1), dtype=torch.bool)
+    mask[3:6] = False  # Skip force features
+    mask[-1] = False  # Skip boundary indicator
+
+    g.x[:, mask] = (g.x[:, mask] - stats["x_mean"][mask]) / x_std_safe[mask]
     g.y = (g.y - stats["y_mean"]) / y_std_safe
     g.edge_attr = (g.edge_attr - stats["e_mean"]) / e_std_safe
     return g
