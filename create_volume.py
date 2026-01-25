@@ -4,12 +4,16 @@ from pathlib import Path
 
 import gmsh
 import meshio
+import numpy as np
 import trimesh
+
+from grasp.AntipodalGrasp import AntipodalGraspSampler
+from grasp.Gripper import RobotiqHandE
 
 DOMAIN_TAG = 1
 BOUNDARY_TAG = 2
 
-TARGET_SIZE = 0.05  # (m)
+TARGET_SIZE = 0.049  # (m)
 
 
 def parse_args():
@@ -24,7 +28,7 @@ def parse_args():
         "--input-dir",
         type=Path,
         default=Path("meshes/thingi10k/stl"),
-        help="Directory containing STL files.",
+        help="Directory containing STL/STEP files.",
     )
     p.add_argument(
         "--output-dir",
@@ -143,7 +147,50 @@ def normalize_z(mesh: meshio.Mesh):
     return mesh
 
 
-L = TARGET_SIZE / 20  # Characteristic length for mesh elements
+# Characteristic length for mesh elements (1/20 for fine mesh, 1/10 for coarse mesh)
+L = TARGET_SIZE / 10
+
+
+gripper = RobotiqHandE("grasp/finger.step")
+
+
+def compute_scale_factor(step_path: Path, rng=None, n=50) -> float:
+    scene = trimesh.load(str(step_path))
+    geometries = list(scene.geometry.values())
+    mesh = trimesh.util.concatenate(geometries)
+    mesh.fill_holes()
+    mesh.vertices -= mesh.centroid
+    mesh.vertices[:, 2] -= mesh.vertices[:, 2].min()
+
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    scales = np.linspace(0.04, 0.08, num=5)
+
+    for scale in scales[::-1]:
+        mesh_copy = mesh.copy()
+        mesh_copy.apply_scale(scale / mesh.extents.max())
+        sampler = AntipodalGraspSampler(gripper, mesh_copy, {"friction_coeff": 0.1})
+        grasps = sampler.sample(n)
+        if len(grasps) == n:
+            return scale
+    return None
+
+
+def process_file(in_path: Path, out_path: Path, file_format: str, debug: bool = False):
+    """Process a single mesh file and convert it to volumetric .msh format."""
+    if file_format == "stl":
+        create_volume_stl(in_path, out_path)
+    else:  # step format
+        # scale_factor = compute_scale_factor(in_path)
+        # if scale_factor is None:
+        #     raise RuntimeError("Failed to compute scale factor.")
+        # if debug:
+        #     print(f"Computed scale factor: {scale_factor}")
+        create_volume_step(in_path, out_path, debug=debug)
+        mesh = meshio.read(out_path)
+        mesh = normalize_z(mesh)
+        meshio.gmsh.write(out_path, mesh, fmt_version="2.2", binary=False)
 
 
 def main():
@@ -155,41 +202,32 @@ def main():
     gmsh.option.setNumber("Mesh.CharacteristicLengthMax", L)
     gmsh.option.setString("Geometry.OCCTargetUnit", "M")
 
+    # Process single file or batch
     if args.file is not None:
-        in_path = args.file
-        out_path = Path("meshes") / (in_path.stem + ".msh")
-        if args.format == "stl":
-            create_volume_stl(in_path, out_path)
-        else:
-            create_volume_step(in_path, out_path, debug=True)
-            mesh = meshio.read(out_path)
-            mesh = normalize_z(mesh)
-            meshio.gmsh.write(out_path, mesh, fmt_version="2.2", binary=False)
+        out_path = Path("meshes") / (args.file.stem + ".msh")
+        process_file(args.file, out_path, args.format, debug=True)
+        print(f"Processed {args.file} -> {out_path}")
     else:
         args.output_dir.mkdir(parents=True, exist_ok=True)
-
         success_count = 0
         fail_count = 0
+
         for in_path in args.input_dir.glob(f"*.{args.format}"):
             out_path = args.output_dir / (in_path.stem + ".msh")
             try:
-                if args.format == "step":
-                    create_volume_step(in_path, out_path)
-                    mesh = meshio.read(out_path)
-                    mesh = normalize_z(mesh)
-                    meshio.gmsh.write(out_path, mesh, fmt_version="2.2", binary=False)
-                else:
-                    create_volume_stl(in_path, out_path)
+                process_file(in_path, out_path, args.format, debug=False)
                 print(f"Processed {in_path} -> {out_path}")
                 success_count += 1
-            except Exception:
-                print(f"Failed to process {in_path}")
+            except Exception as e:
+                print(f"Failed to process {in_path}: {e}")
                 fail_count += 1
+                # Reset gmsh state after failure
                 gmsh.finalize()
                 gmsh.initialize()
                 gmsh.option.setNumber("General.Verbosity", 1)
-                continue
-        print(f"Finished processing: {success_count} succeeded, {fail_count} failed.")
+
+        print(f"Finished: {success_count} succeeded, {fail_count} failed.")
+
     gmsh.finalize()
 
 

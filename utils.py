@@ -113,9 +113,21 @@ def visualize_graph(
         x_min, x_max, y_min, y_max, z_min, z_max = pv_mesh.bounds
         scale = max(x_max - x_min, y_max - y_min, z_max - z_min) * 0.1
 
-        forces = find_contacts(graph)
-        for coord, force in forces.items():
-            arrow = pyvista.Arrow(start=np.asarray(coord), direction=force, scale=scale)
+        x = graph.x[0].cpu().numpy()
+        contacts = x[6:-1].reshape(-1, 6)
+        contacts[:, :3] -= x[:3]
+        contacts[:, :3] *= -1
+        for v in contacts:
+            p = v[:3]
+            f = v[3:]
+
+            # Visualize the contact point
+            sphere = pyvista.Sphere(radius=scale * 0.1)
+            sph = sphere.translate(p, inplace=False)
+            plotter.add_mesh(sph, color="red", opacity=1)
+
+            # Visualize the force arrow
+            arrow = pyvista.Arrow(start=np.asarray(p), direction=f, scale=scale)
             plotter.add_mesh(arrow, color="red")
 
     plotter.show_axes()

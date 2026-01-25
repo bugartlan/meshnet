@@ -84,6 +84,9 @@ def make_nodes(
     v = mesh.points
     n = v.shape[0]
 
+    # Sort the reference contact point and force pair
+    reference.sort(key=lambda x: tuple(x[0]))
+
     # Cartesian coords
     coords = torch.tensor(v, dtype=torch.float32)
 
@@ -95,7 +98,6 @@ def make_nodes(
         forces[idx] = torch.tensor(val, dtype=torch.float32)
 
     # Global attributes
-    # TODO: sorted by coords or forces if multiple contacts
     Ps = []  # (len(reference), n, 3)
     Fs = []  # (len(reference), n, 3)
     for p, f in reference:

@@ -106,6 +106,7 @@ def main():
         dataset_path = Path("data") / f"{args.dataset}.pt"
         data = torch.load(dataset_path, weights_only=False)
         graphs = data["graphs"]
+
     device = torch.device(args.device)
     train_x = torch.cat([g.x for g in graphs], dim=0)
     train_y = torch.cat([g.y for g in graphs], dim=0)
@@ -123,7 +124,7 @@ def main():
     loader = DataLoader(
         [normalize(g, stats) for g in graphs],
         batch_size=args.batch_size,
-        shuffle=False,
+        shuffle=True,
     )
 
     model = EncodeProcessDecode(
@@ -160,7 +161,7 @@ def main():
 
     # Mixed precision training scaler
     scaler = torch.amp.GradScaler()
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.98)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.998)
 
     for epoch in tqdm(range(args.num_epochs)):
         model.train()

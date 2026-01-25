@@ -5,3 +5,4 @@ torchvision
 torch_geometric
 pyvista[jupyter]
 cascadio
+python-fcl
