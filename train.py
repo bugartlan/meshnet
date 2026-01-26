@@ -50,7 +50,7 @@ def parse_args():
     p.add_argument(
         "--target",
         choices=["all", "displacement", "stress"],
-        default="stress",
+        default="all",
         help="Which components to include in the loss calculation.",
     )
     p.add_argument(
@@ -121,8 +121,31 @@ def main():
         normalizer = Normalizer(num_features=data["params"]["node_dim"])
     normalizer.fit(graphs)
 
+    # Exponential scaling factor for mse loss
+    alpha = args.alpha
+    mode = "weighted" if args.weighted_loss else "all"
+
+    # Loss targets
+    if args.target == "all":
+        target_indices = list(range(4))
+    elif args.target == "displacement":
+        target_indices = list(range(3))
+    elif args.target == "stress":
+        target_indices = [3]
+    else:
+        raise ValueError(f"Unknown target: {args.target}")
+
+    num_targets = len(target_indices)
+
+    # Precompute weights and attach to each graph
+    normalized_graphs = []
+    for g in graphs:
+        g_norm = normalizer.normalize(g)
+        g_norm.weight = get_weight(g.x[:, 2], num_targets, mode=mode, alpha=alpha)
+        normalized_graphs.append(g_norm)
+
     loader = DataLoader(
-        [normalizer.normalize(g) for g in graphs],
+        normalized_graphs,
         batch_size=args.batch_size,
         shuffle=True,
     )
@@ -142,20 +165,6 @@ def main():
         for name, param in model.named_parameters():
             print(f"{name}: {param.dtype}, shape: {param.shape}")
 
-    # Exponential scaling factor for mse loss
-    alpha = args.alpha
-    mode = "weighted" if args.weighted_loss else "all"
-
-    # Loss targets
-    if args.target == "all":
-        target_indices = list(range(4))
-    elif args.target == "displacement":
-        target_indices = list(range(3))
-    elif args.target == "stress":
-        target_indices = [3]
-    else:
-        raise ValueError(f"Unknown target: {args.target}")
-
     loss_history = []
     start = time.time()
 
@@ -173,10 +182,9 @@ def main():
             optimizer.zero_grad()
 
             y_true = batch.y[:, target_indices]
-            weight = get_weight(batch.x[:, 2], y_true.shape[1], mode=mode, alpha=alpha)
             with torch.autocast(device_type=args.device, dtype=torch.float16):
                 y_pred = model(batch)[:, target_indices]
-                loss = F.mse_loss(y_pred, y_true, weight=weight)
+                loss = F.mse_loss(y_pred, y_true, weight=batch.weight)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
