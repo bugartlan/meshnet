@@ -118,6 +118,9 @@ def main():
     model_state_dict = checkpoint["model_state_dict"]
     params = checkpoint["params"]
 
+    normalizer = LogNormalizer(
+        num_features=params["node_dim"], device=device, stats=checkpoint["stats"]
+    )
     if checkpoint["normalizer"] == "LogNormalizer":
         normalizer = LogNormalizer(
             num_features=params["node_dim"], device=device, stats=checkpoint["stats"]
@@ -157,7 +160,7 @@ def main():
             normalized_g = normalizer.normalize(g)
 
             y_pred = model(normalized_g)
-            y_pred = normalizer.denormalize(y_pred)
+            y_pred = normalizer.denormalize_y(y_pred)
 
             g_pred = g.clone()
             g_pred.y = y_pred

@@ -7,7 +7,9 @@ class Normalizer:
         self.num_features = num_features
         self.device = device
         self.mask = self._get_mask(num_features)
-        self.stats = stats
+        self.stats = (
+            {key: value.to(device) for key, value in stats.items()} if stats else None
+        )
 
     def _get_mask(self, num_features: int) -> torch.Tensor:
         """Helper to create the boolean mask."""
@@ -61,10 +63,11 @@ class LogNormalizer(Normalizer):
 
     def normalize(self, graph: Data) -> Data:
         g = graph.clone()
-        g.y = torch.log1p(g.y)
+        g.y[:, 3] = torch.log1p(g.y[:, 3])
 
         return super().normalize(g)
 
     def denormalize_y(self, y: torch.Tensor) -> torch.Tensor:
         log_y = super().denormalize_y(y)
-        return torch.expm1(log_y)
+        log_y[:, 3] = torch.expm1(log_y[:, 3])
+        return log_y

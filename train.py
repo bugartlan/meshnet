@@ -38,6 +38,11 @@ def parse_args():
 
     # --- Training Configuration ---
     p.add_argument(
+        "--log-loss",
+        action="store_true",
+        help="Whether to use log scaling for the loss computation.",
+    )
+    p.add_argument(
         "--weighted-loss",
         action="store_true",
         help="Whether to use weighted MSE loss based on distance to the bottom.",
@@ -110,7 +115,10 @@ def main():
 
     device = torch.device(args.device)
 
-    normalizer = LogNormalizer(num_features=data["params"]["node_dim"])
+    if args.log_loss:
+        normalizer = LogNormalizer(num_features=data["params"]["node_dim"])
+    else:
+        normalizer = Normalizer(num_features=data["params"]["node_dim"])
     normalizer.fit(graphs)
 
     loader = DataLoader(
@@ -155,8 +163,8 @@ def main():
     scaler = torch.amp.GradScaler()
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.998)
 
+    model.train()
     for epoch in tqdm(range(args.num_epochs)):
-        model.train()
         total_loss = 0.0
         total_nodes = 0
 
