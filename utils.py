@@ -235,8 +235,9 @@ def normalize(graph, stats):
     mask[-1] = False  # Skip boundary indicator
 
     g.x[:, mask] = (g.x[:, mask] - stats["x_mean"][mask]) / x_std_safe[mask]
-    g.y = (g.y - stats["y_mean"]) / y_std_safe
     g.edge_attr = (g.edge_attr - stats["e_mean"]) / e_std_safe
+    # g.y = (g.y - stats["y_mean"]) / y_std_safe
+    g.y = torch.log(1 + g.y)  # Log-transform to reduce stress value range
     return g
 
 

@@ -5,9 +5,9 @@ import meshio
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch_geometric.loader import DataLoader
 
 from nets import EncodeProcessDecode
+from normalizer import LogNormalizer, Normalizer
 from utils import (
     get_weight,
     make_pv_mesh,
@@ -117,7 +117,16 @@ def main():
     )
     model_state_dict = checkpoint["model_state_dict"]
     params = checkpoint["params"]
-    stats = {k: v.to(device) for k, v in checkpoint["stats"].items()}
+
+    if checkpoint["normalizer"] == "LogNormalizer":
+        normalizer = LogNormalizer(
+            num_features=params["node_dim"], device=device, stats=checkpoint["stats"]
+        )
+    else:
+        normalizer = Normalizer(
+            num_features=params["node_dim"], device=device, stats=checkpoint["stats"]
+        )
+
     model = EncodeProcessDecode(
         node_dim=params["node_dim"],
         edge_dim=params["edge_dim"],
@@ -145,10 +154,10 @@ def main():
     graphs_pred = []
     with torch.no_grad():
         for g in graphs:
-            normalized_g = normalize(g, stats)
+            normalized_g = normalizer.normalize(g)
 
             y_pred = model(normalized_g)
-            y_pred = y_pred * stats["y_std"] + stats["y_mean"]
+            y_pred = normalizer.denormalize(y_pred)
 
             g_pred = g.clone()
             g_pred.y = y_pred

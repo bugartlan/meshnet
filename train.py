@@ -9,6 +9,7 @@ from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
 from nets import EncodeProcessDecode
+from normalizer import LogNormalizer, Normalizer
 from utils import get_weight, normalize
 
 
@@ -108,21 +109,12 @@ def main():
         graphs = data["graphs"]
 
     device = torch.device(args.device)
-    train_x = torch.cat([g.x for g in graphs], dim=0)
-    train_y = torch.cat([g.y for g in graphs], dim=0)
-    train_e = torch.cat([g.edge_attr for g in graphs], dim=0)
 
-    stats = {
-        "x_mean": train_x.mean(dim=0),
-        "x_std": train_x.std(dim=0),
-        "y_mean": train_y.mean(dim=0),
-        "y_std": train_y.std(dim=0),
-        "e_mean": train_e.mean(dim=0),
-        "e_std": train_e.std(dim=0),
-    }
+    normalizer = LogNormalizer(num_features=data["params"]["node_dim"])
+    normalizer.fit(graphs)
 
     loader = DataLoader(
-        [normalize(g, stats) for g in graphs],
+        [normalizer.normalize(g) for g in graphs],
         batch_size=args.batch_size,
         shuffle=True,
     )
@@ -210,7 +202,8 @@ def main():
                 "message_passing_steps": args.layers,
                 "use_layer_norm": USE_LAYER_NORM,
             },
-            "stats": stats,
+            "normalizer": normalizer.__class__.__name__,
+            "stats": normalizer.stats,
             "training_args": {
                 "num_epochs": args.num_epochs,
                 "learning_rate": args.learning_rate,
