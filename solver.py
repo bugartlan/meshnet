@@ -1,9 +1,10 @@
+import gmsh
 import meshio
 import numpy as np
 import pyvista
 import trimesh
 import ufl
-from dolfinx import default_scalar_type, fem, geometry, mesh, plot
+from dolfinx import default_scalar_type, fem, geometry, log, mesh, plot
 from dolfinx.fem.petsc import LinearProblem
 from dolfinx.io import gmshio
 from mpi4py import MPI
@@ -44,7 +45,7 @@ def make_contact_patch(object_mesh, query, fdim, domain, x0, r, n, tag=1):
         )
         n_smooth /= np.linalg.norm(n_smooth, axis=1, keepdims=True)
         return (np.linalg.norm(x.T - x0, axis=1) < r) & (
-            np.dot(n_smooth, n).reshape(-1) > 0.5
+            np.dot(n_smooth, n).reshape(-1) > 0.3
         )
 
     candidate_facets = mesh.locate_entities_boundary(domain, fdim, contact)
@@ -97,8 +98,14 @@ def solve(
     filename_msh: str = "cantilever.msh",
     debug: bool = False,
 ):
+    if not gmsh.is_initialized():
+        gmsh.initialize()
+    gmsh.option.setNumber("General.Verbosity", 0)
+    log.set_log_level(log.LogLevel.OFF)
+
     comm = MPI.COMM_WORLD
     domain, _, _ = gmshio.read_from_msh(filename_msh, comm, rank=0, gdim=3)
+
     x = domain.geometry.x
     xmin = x.min(axis=0)
     xmax = x.max(axis=0)
@@ -164,8 +171,8 @@ def solve(
     # Stress computation
     s_von_mises = sigma(uh) - 1.0 / 3 * ufl.tr(sigma(uh)) * ufl.Identity(len(uh))
     von_mises = ufl.sqrt(3 / 2 * ufl.inner(s_von_mises, s_von_mises))
-    # ("DG, 0") for cell-wise constant stress
-    # ("CG, 1") for nodal stress
+
+    # ("DG, 0") for cell-wise constant stress; ("CG, 1") for nodal stress
     V_von_mises = fem.functionspace(domain, ("CG", 1))
     stress_expr_vm = fem.Expression(
         von_mises, V_von_mises.element.interpolation_points()

@@ -106,6 +106,8 @@ def make_graphs(
     points: np.ndarray,
     msh_path: Path,
     contact_radius: float,
+    N: int = 10,
+    force_max: float = 10,
     debug: bool = False,
 ):
     """
@@ -118,6 +120,7 @@ def make_graphs(
         msh_path (Path): Path to the .msh file for FEA solver.
         contact_radius (float): Radius around contact points.
         debug (bool): Whether to enable verbose logging.
+        N (int): Number of force scaling steps.
 
     Returns:
         list[Data]: List of PyTorch Geometric Data objects.
@@ -126,20 +129,25 @@ def make_graphs(
 
     # Iterate over samples
     for p, f_vec in zip(points, f):
-        # Create (point, force) pairs
-        contacts = list(zip(p, f_vec))
+        step = force_max / N
+        scales = np.arange(step, force_max + step / 2, step)
 
-        # Run FEA
-        domain, stresses_vm, uh = solve(
-            contacts,
-            contact_radius=contact_radius,
-            debug=debug,
-            filename_msh=str(msh_path),
-        )
+        for scale in scales:
+            contacts = list(zip(p, f_vec * scale))
 
-        # Interpolate and build graph
-        y = interp_pyvista(domain, [uh, stresses_vm], mesh.points)
-        graphs.append(build_graph(mesh, y, radius=contact_radius, contacts=contacts))
+            # Run FEA
+            domain, stresses_vm, uh = solve(
+                contacts,
+                contact_radius=contact_radius,
+                debug=debug,
+                filename_msh=str(msh_path),
+            )
+
+            # Interpolate and build graph
+            y = interp_pyvista(domain, [uh, stresses_vm], mesh.points)
+            graphs.append(
+                build_graph(mesh, y, radius=contact_radius, contacts=contacts)
+            )
 
     return graphs
 
@@ -236,14 +244,22 @@ def generate_random_contacts(
     )  # Shape: (n_samples, n_contacts, 3)
 
     # Generate random force vectors for each contact point
-    forces = rng.uniform(
-        low=-force_max,
-        high=force_max,
-        size=(n_samples, n_contacts, 3),  # Shape: (n_samples, n_contacts, 3)
-    )
+    # Shape: (n_samples, n_contacts, 3)
+    forces = rng.standard_normal(size=(n_samples, n_contacts, 3))
+    forces = forces / np.linalg.norm(forces, axis=-1, keepdims=True)
 
-    contact_radius = get_adaptive_radius(mesh_tri, multiplier=2.0)
-    graphs = make_graphs(mesh_mio, forces, points, file, contact_radius, debug=debug)
+    # contact_radius = get_adaptive_radius(mesh_tri, multiplier=2.0)
+    contact_radius = 0.01
+    graphs = make_graphs(
+        mesh_mio,
+        forces,
+        points,
+        file,
+        contact_radius,
+        N=10,
+        force_max=force_max,
+        debug=debug,
+    )
 
     node_dim, edge_dim, output_dim = info(graphs[0], debug=False)
     torch.save(

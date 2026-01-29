@@ -7,13 +7,11 @@ import meshio
 import numpy as np
 import trimesh
 
-from grasp.AntipodalGrasp import AntipodalGraspSampler
-from grasp.Gripper import RobotiqHandE
-
 DOMAIN_TAG = 1
 BOUNDARY_TAG = 2
 
-TARGET_SIZE = 0.049  # (m)
+TARGET_SIZE = 0.1  # (m)
+L = 0.002
 
 
 def parse_args():
@@ -88,6 +86,8 @@ def create_volume_stl(stl_path: Path, out_path: Path):
 def create_volume_step(step_path: Path, out_path: Path, debug: bool = False):
     gmsh.clear()
 
+    print(f"Importing STEP file: {step_path}")
+
     gmsh.model.add("mesh_volume")
     gmsh.model.occ.importShapes(str(step_path))
     gmsh.model.occ.synchronize()
@@ -106,11 +106,21 @@ def create_volume_step(step_path: Path, out_path: Path, debug: bool = False):
     max_dim = max(dx, dy, dz)
     scale = TARGET_SIZE / max_dim
 
+    # Center the volume at the origin
     com = gmsh.model.occ.getCenterOfMass(3, vol_tag)
-    gmsh.model.occ.translate(volumes, -com[0], -com[1], -com[2])
+    # gmsh.model.occ.translate(volumes, -com[0], -com[1], -com[2])
+    # gmsh.model.occ.synchronize()
+
+    print(f"Scaling volume by factor: {scale}")
+
+    transform = np.diag([scale, scale, scale, 1.0])
+    transform[:3, 3] = -scale * np.array(com)
+    gmsh.model.occ.affine_transform(volumes, transform.flatten().tolist())
     gmsh.model.occ.synchronize()
-    gmsh.model.occ.dilate(volumes, 0.0, 0.0, 0.0, scale, scale, scale)
-    gmsh.model.occ.synchronize()
+
+    # Scale the volume
+    # gmsh.model.occ.dilate(volumes, 0.0, 0.0, 0.0, scale, scale, scale)
+    # gmsh.model.occ.synchronize()
 
     vol_tags = [v[1] for v in volumes]
     gmsh.model.addPhysicalGroup(3, vol_tags, DOMAIN_TAG, name="domain")
@@ -147,46 +157,11 @@ def normalize_z(mesh: meshio.Mesh):
     return mesh
 
 
-# Characteristic length for mesh elements (1/20 for fine mesh, 1/10 for coarse mesh)
-L = TARGET_SIZE / 10
-
-
-gripper = RobotiqHandE("grasp/finger.step")
-
-
-def compute_scale_factor(step_path: Path, rng=None, n=50) -> float:
-    scene = trimesh.load(str(step_path))
-    geometries = list(scene.geometry.values())
-    mesh = trimesh.util.concatenate(geometries)
-    mesh.fill_holes()
-    mesh.vertices -= mesh.centroid
-    mesh.vertices[:, 2] -= mesh.vertices[:, 2].min()
-
-    if rng is None:
-        rng = np.random.default_rng(42)
-
-    scales = np.linspace(0.04, 0.08, num=5)
-
-    for scale in scales[::-1]:
-        mesh_copy = mesh.copy()
-        mesh_copy.apply_scale(scale / mesh.extents.max())
-        sampler = AntipodalGraspSampler(gripper, mesh_copy, {"friction_coeff": 0.1})
-        grasps = sampler.sample(n)
-        if len(grasps) == n:
-            return scale
-    return None
-
-
 def process_file(in_path: Path, out_path: Path, file_format: str, debug: bool = False):
     """Process a single mesh file and convert it to volumetric .msh format."""
     if file_format == "stl":
         create_volume_stl(in_path, out_path)
-    else:  # step format
-        # scale_factor = compute_scale_factor(in_path)
-        # if scale_factor is None:
-        #     raise RuntimeError("Failed to compute scale factor.")
-        # if debug:
-        #     print(f"Computed scale factor: {scale_factor}")
+    else:
         create_volume_step(in_path, out_path, debug=debug)
         mesh = meshio.read(out_path)
         mesh = normalize_z(mesh)
@@ -220,11 +195,16 @@ def main():
                 success_count += 1
             except Exception as e:
                 print(f"Failed to process {in_path}: {e}")
+                in_path.unlink(missing_ok=True)
                 fail_count += 1
                 # Reset gmsh state after failure
+                print("Re-initializing gmsh...")
                 gmsh.finalize()
                 gmsh.initialize()
                 gmsh.option.setNumber("General.Verbosity", 1)
+                gmsh.option.setNumber("Mesh.CharacteristicLengthMin", L)
+                gmsh.option.setNumber("Mesh.CharacteristicLengthMax", L)
+                gmsh.option.setString("Geometry.OCCTargetUnit", "M")
 
         print(f"Finished: {success_count} succeeded, {fail_count} failed.")
 
