@@ -5,6 +5,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
@@ -82,6 +83,17 @@ def parse_args():
         "--plots",
         action="store_true",
         help="Whether to show the training loss plot.",
+    )
+    p.add_argument(
+        "--tensorboard",
+        action="store_true",
+        help="Whether to enable TensorBoard logging.",
+    )
+    p.add_argument(
+        "--log-dir",
+        type=Path,
+        default=Path("runs/"),
+        help="Directory to save TensorBoard logs.",
     )
     p.add_argument(
         "--debug",
@@ -165,6 +177,17 @@ def main():
         for name, param in model.named_parameters():
             print(f"{name}: {param.dtype}, shape: {param.shape}")
 
+    # Initialize TensorBoard writer
+    writer = None
+    if args.tensorboard:
+        model_name = (
+            args.model_name if args.model_name
+            else f"{args.dataset}_{args.target}_{'w' if args.weighted_loss else 'uw'}"
+        )
+        log_path = args.log_dir / model_name
+        writer = SummaryWriter(log_dir=log_path)
+        print(f"TensorBoard logging to: {log_path}")
+
     loss_history = []
     start = time.time()
 
@@ -197,6 +220,12 @@ def main():
 
         avg_loss = total_loss / total_nodes
         loss_history.append(avg_loss)
+        
+        # Log to TensorBoard
+        if writer is not None:
+            writer.add_scalar('Loss/train', avg_loss, epoch)
+            writer.add_scalar('Learning_Rate', scheduler.get_last_lr()[0], epoch)
+        
         if (epoch + 1) % 50 == 0:
             tqdm.write(f"Epoch {epoch + 1}/{args.num_epochs}, Loss: {avg_loss:.6f}")
 
@@ -231,6 +260,10 @@ def main():
 
     end = time.time()
     print(f"Training completed in {end - start:.2f} seconds.")
+
+    if writer is not None:
+        writer.close()
+        print(f"TensorBoard logs saved to: {log_path}")
 
     if args.plots:
         plt.plot(loss_history)
