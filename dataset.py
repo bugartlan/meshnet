@@ -256,7 +256,7 @@ def generate_random_contacts(
         points,
         file,
         contact_radius,
-        N=10,
+        N=1,
         force_max=force_max,
         debug=debug,
     )

@@ -12,9 +12,9 @@ from utils import (
     get_weight,
     make_pv_mesh,
     msh_to_trimesh,
-    normalize,
     strain_stress_vm,
     visualize_graph,
+    visualize_graph_bottom,
 )
 
 ################################ Material Properties ###################################
@@ -197,49 +197,57 @@ def main():
         idx = rng.choice(len(graphs_pred), size=n_samples, replace=False)
 
         is_coarse = args.dataset.endswith("_c")
+        msh_subdir = "msh_coarse" if is_coarse else "msh"
+        msh_path = args.mesh_dir / msh_subdir / f"{mesh_name}.msh"
+        mesh = msh_to_trimesh(meshio.read(msh_path))
+
+        show_forces = args.mode != "bottom"
+        suffix = "_bottom" if args.mode == "bottom" else ""
 
         for i in range(n_samples):
-            msh_path = (
-                args.mesh_dir
-                / ("msh_coarse" if is_coarse else "msh")
-                / f"{mesh_name}.msh"
-            )
-            mesh = msh_to_trimesh(meshio.read(msh_path))
-
             g_true = graphs[idx[i]].cpu()
             g_pred = graphs_pred[idx[i]].cpu()
 
             pv_mesh_true = make_pv_mesh(mesh, g_true, labels)
             pv_mesh_pred = make_pv_mesh(mesh, g_pred, labels)
 
-            for j in target_indices:
-                label_name = labels[j].replace(" ", "_")
+            if args.mode == "bottom":
+                pv_mesh_true = pv_mesh_true.clip(normal=(0, 0, 1), origin=(0, 0, 1e-4))
+                pv_mesh_pred = pv_mesh_pred.clip(normal=(0, 0, 1), origin=(0, 0, 1e-4))
 
-                # Determine color limits based on true values
-                clim = (pv_mesh_true[labels[j]].min(), pv_mesh_true[labels[j]].max())
+            for j in target_indices:
+                label = labels[j]
+                label_name = label.replace(" ", "_")
+
+                # Calculate shared color limits from ground truth
+                clim = (pv_mesh_true[label].min(), pv_mesh_true[label].max())
+
+                # Generate filenames
                 filename_true = (
-                    args.plot_dir / f"{mesh_name}_sample{i}_true_{label_name}.html"
+                    args.plot_dir
+                    / f"{mesh_name}_smpl{i}_true_{label_name}{suffix}.html"
                 )
                 filename_pred = (
-                    args.plot_dir / f"{mesh_name}_sample{i}_pred_{label_name}.html"
+                    args.plot_dir
+                    / f"{mesh_name}_smpl{i}_pred_{label_name}{suffix}.html"
                 )
 
-                # Plot ground truth and prediction
+                # Visualize ground truth and prediction
                 visualize_graph(
                     pv_mesh_true,
                     g_true,
-                    label=labels[j],
+                    label=label,
                     show=False,
-                    force_arrows=True,
+                    force_arrows=show_forces,
                     clim=clim,
                     filename=filename_true,
                 )
                 visualize_graph(
                     pv_mesh_pred,
                     g_pred,
-                    label=labels[j],
+                    label=label,
                     show=False,
-                    force_arrows=True,
+                    force_arrows=show_forces,
                     clim=clim,
                     filename=filename_pred,
                 )

@@ -137,54 +137,6 @@ def visualize_graph(
         plotter.export_html(filename)
 
 
-def visualize(
-    mesh: trimesh.Trimesh,
-    graph: Data,
-    v_idx: int = 0,
-    label: str = "VonMisesStress",
-    jupyter_backend: str = None,
-    force_arrows=False,
-    show: bool = True,
-    filename: str = None,
-):
-    values = graph.y[:, v_idx].cpu().numpy().squeeze()
-
-    tree = cKDTree(mesh.vertices)
-    _, idx = tree.query(mesh.vertices)
-
-    values_mesh = values[idx]
-    pv_mesh = pyvista.wrap(mesh)
-    pv_mesh[label] = values_mesh
-
-    scale = mesh.extents.max() * 0.1
-    plotter = pyvista.Plotter(notebook=jupyter_backend is not None)
-    plotter.add_mesh(
-        pv_mesh,
-        scalars=label,
-        point_size=1,
-        render_points_as_spheres=True,
-        show_edges=True,
-    )
-
-    if force_arrows:
-        forces = find_contacts(graph)
-        for coord, force in forces.items():
-            arrow = pyvista.Arrow(
-                start=np.asarray(coord),
-                direction=force,
-                scale=scale,
-            )
-            plotter.add_mesh(arrow, color="red")
-
-    plotter.show_axes()
-
-    if filename is not None:
-        plotter.export_html(filename)
-
-    if show:
-        plotter.show(jupyter_backend=jupyter_backend)
-
-
 def msh_to_trimesh(mesh: meshio.Mesh) -> trimesh.Trimesh:
     """
     Convert a meshio.Mesh to a trimesh.Trimesh object.
@@ -198,47 +150,6 @@ def msh_to_trimesh(mesh: meshio.Mesh) -> trimesh.Trimesh:
     triangles = [c.data for c in mesh.cells if c.type == "triangle"]
     faces = np.vstack(triangles)
     return trimesh.Trimesh(vertices=mesh.points, faces=faces, process=False)
-
-
-def normalize(graph, stats):
-    """
-    Normalize graph features using provided statistics.
-
-    Normalizes node positions and edge attributes while preserving sparse force features
-    (indices 3-5) and the boundary indicator (last feature).
-
-    Normalize the relative positions using the mean and std of the world coordinates.
-
-    Args:
-        graph (Data): Input graph with x, y, and edge_attr attributes.
-        stats (dict): Dictionary containing mean and std for x, y, and edge_attr.
-
-    Returns:
-        Data: Normalized graph.
-    """
-
-    g = graph.clone()
-    # Handle std = 0 case by replacing with 1 (skips normalization for constant features)
-    x_std_safe = torch.where(
-        stats["x_std"] > 0, stats["x_std"], torch.ones_like(stats["x_std"])
-    )
-    y_std_safe = torch.where(
-        stats["y_std"] > 0, stats["y_std"], torch.ones_like(stats["y_std"])
-    )
-    e_std_safe = torch.where(
-        stats["e_std"] > 0, stats["e_std"], torch.ones_like(stats["e_std"])
-    )
-
-    # Normalize node features (excluding last feature)
-    mask = torch.ones(g.x.size(1), dtype=torch.bool)
-    mask[3:6] = False  # Skip force features
-    mask[-1] = False  # Skip boundary indicator
-
-    g.x[:, mask] = (g.x[:, mask] - stats["x_mean"][mask]) / x_std_safe[mask]
-    g.edge_attr = (g.edge_attr - stats["e_mean"]) / e_std_safe
-    # g.y = (g.y - stats["y_mean"]) / y_std_safe
-    g.y = torch.log(1 + g.y)  # Log-transform to reduce stress value range
-    return g
 
 
 def get_weight(

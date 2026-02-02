@@ -5,13 +5,12 @@ from pathlib import Path
 import gmsh
 import meshio
 import numpy as np
-import trimesh
 
 DOMAIN_TAG = 1
 BOUNDARY_TAG = 2
 
-TARGET_SIZE = 0.1  # (m)
-L = 0.002
+# L = 0.006 for coarse meshes; L = 0.003 for fine meshes
+L = 0.003  # Target mesh element size
 
 
 def parse_args():
@@ -35,29 +34,31 @@ def parse_args():
         help="Directory to save generated volumetric mesh files.",
     )
     p.add_argument(
-        "--file",
+        "--input-file",
         type=Path,
         default=None,
         help="Optional specific file to process.",
     )
+    p.add_argument(
+        "--output-file",
+        type=str,
+        default=None,
+        help="Output filename for single file processing.",
+    )
+    p.add_argument(
+        "--target-size",
+        type=float,
+        default=0.1,
+        help="Target size (max dimension) of the scaled mesh in meters.",
+    )
     return p.parse_args()
 
 
-def scale_stl_mesh(stl_path: Path, target_size: float):
-    mesh = trimesh.load(str(stl_path))
-    scale = target_size / mesh.extents.max()
-    mesh.apply_scale(scale)
-    out_path = stl_path.parent / (stl_path.stem + "_scaled.stl")
-    mesh.export(str(out_path))
-    return out_path
-
-
-def create_volume_stl(stl_path: Path, out_path: Path):
-    scaled_stl_path = scale_stl_mesh(stl_path, TARGET_SIZE)
+def create_volume_stl(stl_path: Path, out_path: Path, target_size: float):
     gmsh.clear()
 
     gmsh.model.add("mesh_volume")
-    gmsh.merge(str(scaled_stl_path))
+    gmsh.merge(str(stl_path))
     gmsh.model.geo.removeAllDuplicates()
 
     angle_threshold = 45  # degrees
@@ -83,7 +84,9 @@ def create_volume_stl(stl_path: Path, out_path: Path):
     gmsh.write(str(out_path))
 
 
-def create_volume_step(step_path: Path, out_path: Path, debug: bool = False):
+def create_volume_step(
+    step_path: Path, out_path: Path, target_size: float, debug: bool = False
+):
     gmsh.clear()
 
     print(f"Importing STEP file: {step_path}")
@@ -104,7 +107,7 @@ def create_volume_step(step_path: Path, out_path: Path, debug: bool = False):
     dy = y1 - y0
     dz = z1 - z0
     max_dim = max(dx, dy, dz)
-    scale = TARGET_SIZE / max_dim
+    scale = target_size / max_dim
 
     # Center the volume at the origin
     com = gmsh.model.occ.getCenterOfMass(3, vol_tag)
@@ -157,31 +160,47 @@ def normalize_z(mesh: meshio.Mesh):
     return mesh
 
 
-def process_file(in_path: Path, out_path: Path, file_format: str, debug: bool = False):
+def process_file(
+    in_path: Path,
+    out_path: Path,
+    file_format: str,
+    target_size: float,
+    debug: bool = False,
+):
     """Process a single mesh file and convert it to volumetric .msh format."""
     if file_format == "stl":
-        create_volume_stl(in_path, out_path)
+        create_volume_stl(in_path, out_path, target_size=target_size)
     else:
-        create_volume_step(in_path, out_path, debug=debug)
+        create_volume_step(in_path, out_path, target_size=target_size, debug=debug)
         mesh = meshio.read(out_path)
         mesh = normalize_z(mesh)
         meshio.gmsh.write(out_path, mesh, fmt_version="2.2", binary=False)
 
 
-def main():
-    args = parse_args()
-
+def gmsh_initialize():
     gmsh.initialize()
     gmsh.option.setNumber("General.Verbosity", 1)
     gmsh.option.setNumber("Mesh.CharacteristicLengthMin", L)
     gmsh.option.setNumber("Mesh.CharacteristicLengthMax", L)
     gmsh.option.setString("Geometry.OCCTargetUnit", "M")
 
+
+def main():
+    args = parse_args()
+    target_size = args.target_size
+
+    gmsh_initialize()
+
     # Process single file or batch
-    if args.file is not None:
-        out_path = Path("meshes") / (args.file.stem + ".msh")
-        process_file(args.file, out_path, args.format, debug=True)
-        print(f"Processed {args.file} -> {out_path}")
+    if args.input_file is not None:
+        if args.output_file is not None:
+            out_path = Path(args.output_file)
+        else:
+            out_path = Path("meshes") / (args.input_file.stem + ".msh")
+        process_file(
+            args.input_file, out_path, args.format, target_size=target_size, debug=True
+        )
+        print(f"Processed {args.input_file} -> {out_path}")
     else:
         args.output_dir.mkdir(parents=True, exist_ok=True)
         success_count = 0
@@ -190,7 +209,9 @@ def main():
         for in_path in args.input_dir.glob(f"*.{args.format}"):
             out_path = args.output_dir / (in_path.stem + ".msh")
             try:
-                process_file(in_path, out_path, args.format, debug=False)
+                process_file(
+                    in_path, out_path, args.format, target_size=target_size, debug=False
+                )
                 print(f"Processed {in_path} -> {out_path}")
                 success_count += 1
             except Exception as e:
@@ -200,11 +221,7 @@ def main():
                 # Reset gmsh state after failure
                 print("Re-initializing gmsh...")
                 gmsh.finalize()
-                gmsh.initialize()
-                gmsh.option.setNumber("General.Verbosity", 1)
-                gmsh.option.setNumber("Mesh.CharacteristicLengthMin", L)
-                gmsh.option.setNumber("Mesh.CharacteristicLengthMax", L)
-                gmsh.option.setString("Geometry.OCCTargetUnit", "M")
+                gmsh_initialize()
 
         print(f"Finished: {success_count} succeeded, {fail_count} failed.")
 

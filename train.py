@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from nets import EncodeProcessDecode
 from normalizer import LogNormalizer, Normalizer
-from utils import get_weight, normalize
+from utils import get_weight
 
 
 def parse_args():
