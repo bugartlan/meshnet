@@ -3,7 +3,6 @@ import numpy as np
 import pyvista
 import torch
 import trimesh
-from scipy.spatial import cKDTree
 from torch_geometric.data import Data
 
 
@@ -120,6 +119,7 @@ def visualize_graph(
         for v in contacts:
             p = v[:3]
             f = v[3:]
+            print(p, f)
 
             # Visualize the contact point
             sphere = pyvista.Sphere(radius=scale * 0.1)
@@ -147,7 +147,7 @@ def msh_to_trimesh(mesh: meshio.Mesh) -> trimesh.Trimesh:
     Returns:
         trimesh.Trimesh: Converted trimesh object.
     """
-    triangles = [c.data for c in mesh.cells if c.type == "triangle"]
+    triangles = [c.data for c in mesh.cells if "triangle" in c.type]
     faces = np.vstack(triangles)
     return trimesh.Trimesh(vertices=mesh.points, faces=faces, process=False)
 

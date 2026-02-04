@@ -1,0 +1,143 @@
+import meshio
+import numpy as np
+import torch
+from torch_geometric.data import Data
+
+
+class GraphBuilder:
+    def __init__(self, contact_radius: float = 0.01, std: float = 0.001):
+        self.contact_radius = contact_radius
+        self.std = std
+
+        self.boundary_tol = 1e-6
+
+    def build(
+        self,
+        mesh: meshio.Mesh,
+        y: np.ndarray,
+        radius: float = 1.0,
+        contacts: list[tuple] | None = None,
+    ) -> Data:
+        # Node feature matrix with shape [num_nodes, num_node_features]
+        x = self._make_nodes(mesh, contacts)
+        y = torch.tensor(y, dtype=torch.float32)
+        edge_index, edge_attr = self._make_edges(mesh)
+
+        return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
+
+    def gaussian_loads(self, coords: np.ndarray, contacts: list[tuple]) -> float:
+        num_nodes = coords.shape[0]
+        nodal_forces = np.zeros((num_nodes, 3), dtype=np.float32)
+
+        if not contacts:
+            return nodal_forces
+
+        for point, force in contacts:
+            point = np.asarray(point)  # (3,)
+            force = np.asarray(force)  # (3, )
+
+            dist_sq = np.sum((coords - point) ** 2, axis=1)
+            weights = np.exp(-dist_sq / (2 * self.std**2))
+            weights_sum = np.sum(weights)
+            if weights_sum > 0:
+                weights /= weights_sum
+
+            nodal_forces += weights[:, None] * force
+
+        return torch.tensor(nodal_forces, dtype=torch.float32)
+
+    def _make_nodes(
+        self,
+        mesh: meshio.Mesh,
+        loads: dict[int, np.ndarray],
+    ) -> torch.Tensor:
+        vertices = mesh.points
+        num_nodes = vertices.shape[0]
+
+        loads.sort(key=lambda x: tuple(x[0]))
+
+        # Position Coordinates
+        coords = torch.tensor(vertices, dtype=torch.float32)
+
+        # Force Vectors
+        forces = self.gaussian_loads(vertices, loads)
+
+        # Global Attributes
+        if loads:
+            Ps = []
+            Fs = []
+            for p, f in loads:
+                Ps.append(torch.tensor(vertices - p, dtype=torch.float32))
+                Fs.append(torch.tensor(np.tile(f, (num_nodes, 1)), dtype=torch.float32))
+
+            inter = torch.stack([torch.stack(Ps), torch.stack(Fs)], dim=1).reshape(
+                -1, num_nodes, 3
+            )
+
+            attrs = inter.permute(1, 0, 2).reshape(num_nodes, -1)
+        else:
+            attrs = torch.zeros((num_nodes, 0), dtype=torch.float32)
+
+        # Boundary Mask
+        mask = torch.zeros((num_nodes, 1), dtype=torch.float32)
+        mask[np.isclose(vertices[:, 2], 0.0, atol=self.boundary_tol)] = 1
+
+        return torch.hstack([coords, forces, attrs, mask])
+
+    def _make_edges(self, mesh: meshio.Mesh) -> torch.Tensor:
+        edge_index = []
+        edge_attr = []
+        edge_sets = []
+
+        v = mesh.points
+        for cell in mesh.cells:
+            data = cell.data
+            if "triangle" in cell.type:
+                edge_sets.append(
+                    np.vstack(
+                        [
+                            data[:, [0, 1]],
+                            data[:, [1, 2]],
+                            data[:, [2, 0]],
+                        ]
+                    )
+                )
+            elif "tetra" in cell.type:
+                edge_sets.append(
+                    np.vstack(
+                        [
+                            data[:, [0, 1]],
+                            data[:, [0, 2]],
+                            data[:, [0, 3]],
+                            data[:, [1, 2]],
+                            data[:, [1, 3]],
+                            data[:, [2, 3]],
+                        ]
+                    )
+                )
+            if not edge_sets:
+                raise ValueError(
+                    "No supported cell types (tetra, triangle) found in mesh."
+                )
+        edges = np.vstack(edge_sets)
+        edges.sort(axis=1)
+        unique_edges = np.unique(edges, axis=0)
+
+        src, dst = unique_edges[:, 0], unique_edges[:, 1]
+        disp = v[dst] - v[src]  # shape (E, 3)
+        dist = np.linalg.norm(disp, axis=1, keepdims=True)  # shape (E, 1)
+
+        # Indices
+        edge_index_fwd = np.stack([src, dst], axis=0)
+        edge_index_bwd = np.stack([dst, src], axis=0)
+        edge_index = np.hstack([edge_index_fwd, edge_index_bwd])  # shape (2, 2E)
+
+        # Attributes
+        attr_fwd = np.hstack([disp, dist])  # shape (E, 4)
+        attr_bwd = np.hstack([-disp, dist])  # shape (E, 4)
+        edge_attr = np.vstack([attr_fwd, attr_bwd])  # shape (2E, 4)
+
+        return (
+            torch.tensor(edge_index, dtype=torch.long),
+            torch.tensor(edge_attr, dtype=torch.float32),
+        )
