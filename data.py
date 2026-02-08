@@ -9,7 +9,6 @@ import trimesh
 from tqdm import tqdm
 
 from graph_builder import GraphBuilder
-from graphs import build_graph
 from simulator import Simulator
 from utils import info, msh_to_trimesh
 
@@ -49,7 +48,7 @@ class DataGenerator:
 
         self.rng = np.random.default_rng(seed)
 
-        self.graph_builder = GraphBuilder(contact_radius=contact_radius, std=sigma)
+        self.builder = GraphBuilder(contact_radius=contact_radius, std=sigma)
 
     def process(self, msh_path: Path):
         """Strategy: CG1 mesh for graph construction and CG2 mesh for simulation accuracy."""
@@ -68,11 +67,8 @@ class DataGenerator:
 
         graphs = []
         for y, p, f in zip(results, points, forces):
-            graph = build_graph(
-                mesh_cg1,
-                y.reshape(-1, 1),
-                radius=self.contact_radius,
-                contacts=list(zip(p, f)),
+            graph = self.builder.build(
+                mesh_cg1, y, radius=self.contact_radius, contacts=list(zip(p, f))
             )
             graphs.append(graph)
 
@@ -119,7 +115,9 @@ class DataGenerator:
             contacts = list(zip(p, f * self.force_max))
             uh = simulator.run(contacts)
             vm = simulator.compute_vm(uh)
-            results.append(simulator.probe(vm, queries))
+            results.append(
+                np.hstack([simulator.probe(uh, queries), simulator.probe(vm, queries)])
+            )
 
         return results
 
@@ -129,7 +127,7 @@ def parse_args():
         description="Generate simulation data from meshes."
     )
     parser.add_argument(
-        "meshes", type=Path, nargs="+", help="Paths to input mesh files."
+        "meshes", type=Path, nargs="+", help="Paths to input mesh files or directories."
     )
     parser.add_argument(
         "--out_dir",
@@ -174,12 +172,18 @@ def main():
         debug=args.debug,
     )
 
-    for msh_path in args.meshes:
-        graphs = generator.process(msh_path)
+    files = []
+    for path in args.meshes:
+        if path.is_file():
+            files.append(path)
+        elif path.is_dir():
+            files.extend(path.glob("*_cg1.msh"))
+        else:
+            raise RuntimeError(f"Path {path} is not a file or directory.")
 
-        out_path = args.out_dir / (
-            msh_path.stem.replace("cg1", f"{args.num_samples}") + ".pt"
-        )
+    for f in files:
+        graphs = generator.process(f)
+        out_path = args.out_dir / (f.stem.replace("cg1", f"{args.num_samples}") + ".pt")
 
         node_dim, edge_dim, output_dim = info(graphs[0])
         torch.save(
@@ -190,7 +194,7 @@ def main():
                     "output_dim": output_dim,
                 },
                 "graphs": graphs,
-                "mesh": msh_path,
+                "mesh": f,
             },
             out_path,
         )

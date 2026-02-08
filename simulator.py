@@ -102,6 +102,9 @@ class Simulator:
 
         candidate_normals = self.compute_facet_normals(candidate_facets)
 
+        # Align normals
+        dots = candidate_normals @ normal
+        candidate_normals[dots < 0] *= -1.0
         mask = np.dot(candidate_normals, normal) > 0.5  # within ~60 degrees
         final_facets = candidate_facets[mask]
         values = np.full(final_facets.shape, tag, dtype=np.int32)
@@ -145,12 +148,6 @@ class Simulator:
         uh = fem.Function(self.V)
         self.solver.solve(b, uh.x.petsc_vec)
         uh.x.scatter_forward()
-
-        # cc = fem.Constant(self.domain, default_scalar_type(1.0))
-        # total_force_applied = fem.assemble_scalar(fem.form(ufl.dot(T, cc) * ufl.ds))
-
-        # print(f"Input Force: {force[0]:.4f} N")  # Assuming force is x-aligned
-        # print(f"Solver Integrated: {total_force_applied:.4f} N")
 
         return uh
 
@@ -222,26 +219,101 @@ class Simulator:
 
     #     return uh
 
+    def compute_vm0(self, uh):
+        V = fem.functionspace(self.domain, ("DG", 0))
+        s = self.sigma(uh) - 1.0 / 3 * ufl.tr(self.sigma(uh)) * ufl.Identity(len(uh))
+        vm_expr = ufl.sqrt(1.5 * ufl.inner(s, s))
+
+        w = ufl.TestFunction(V)
+        vm0 = ufl.TrialFunction(V)
+
+        a = ufl.inner(vm0, w) * ufl.dx
+        L = ufl.inner(vm_expr, w) * ufl.dx
+
+        A = assemble_matrix(fem.form(a))
+        A.assemble()
+        b = assemble_vector(fem.form(L))
+
+        solver = PETSc.KSP().create(self.comm)
+        solver.setOperators(A)
+        solver.setType("preonly")
+        solver.getPC().setType("lu")
+
+        vm = fem.Function(V)
+        solver.solve(b, vm.x.petsc_vec)
+        vm.x.scatter_forward()
+        return vm
+
+    def compute_vm1(self, uh):
+        vm0 = self.compute_vm0(uh)
+        V = fem.functionspace(self.domain, ("CG", 1))
+        w = ufl.TestFunction(V)
+        v = ufl.TrialFunction(V)
+
+        a = ufl.inner(v, w) * ufl.dx
+        L = ufl.inner(vm0, w) * ufl.dx
+
+        A = assemble_matrix(fem.form(a))
+        A.assemble()
+        b = assemble_vector(fem.form(L))
+
+        solver = PETSc.KSP().create(self.comm)
+        solver.setOperators(A)
+        solver.setType("preonly")
+        solver.getPC().setType("lu")
+
+        vm1 = fem.Function(V)
+        solver.solve(b, vm1.x.petsc_vec)
+        vm1.x.scatter_forward()
+        return vm1
+
     def compute_vm(self, uh):
         V = fem.functionspace(self.domain, ("CG", 1))
         s = self.sigma(uh) - 1.0 / 3 * ufl.tr(self.sigma(uh)) * ufl.Identity(len(uh))
-        vm = ufl.sqrt(1.5 * ufl.inner(s, s))
+        vm_expr = ufl.sqrt(1.5 * ufl.inner(s, s))
 
-        # Interpolate expression to function
-        stress_func = fem.Function(V)
-        expr = fem.Expression(vm, V.element.interpolation_points())
-        stress_func.interpolate(expr)
+        u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+        a = ufl.inner(u, v) * ufl.dx
+        L = ufl.inner(vm_expr, v) * ufl.dx
 
-        return stress_func
+        A = assemble_matrix(fem.form(a))
+        A.assemble()
+        b = assemble_vector(fem.form(L))
 
-    def probe(self, vm: fem.Function, points: np.ndarray) -> np.ndarray:
-        topology, cell_types, geometry = plot.vtk_mesh(vm.function_space)
+        solver = PETSc.KSP().create(self.comm)
+        solver.setOperators(A)
+        solver.setType("preonly")
+        solver.getPC().setType("lu")
+
+        vm = fem.Function(V)
+        solver.solve(b, vm.x.petsc_vec)
+        vm.x.scatter_forward()
+        return vm
+
+    def probe(self, func: fem.Function, points: np.ndarray) -> np.ndarray:
+        topology, cell_types, geometry = plot.vtk_mesh(func.function_space)
         grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
-        grid.point_data["vm"] = vm.x.array.real
+        bs = func.function_space.dofmap.index_map_bs
+        grid.point_data["values"] = func.x.array.real.reshape(-1, bs)
         cloud = pyvista.PolyData(points)
         samples = cloud.sample(grid, tolerance=1e-5)
 
-        return samples.point_data["vm"]
+        return samples.point_data["values"].reshape(-1, bs)
+
+    def plot_displacement(self, uh):
+        topology, cell_types, geometry = plot.vtk_mesh(uh.function_space)
+        grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
+        grid.point_data["displacement"] = uh.x.array.real.reshape(-1, 3)
+
+        plotter = pyvista.Plotter()
+        plotter.add_mesh(
+            grid,
+            scalars="displacement",
+            show_edges=True,
+            scalar_bar_args={"title": "Displacement (m)"},
+        )
+        plotter.show_axes()
+        plotter.show()
 
     def plot_vm(self, vm):
         topology, cell_types, geometry = plot.vtk_mesh(vm.function_space)
@@ -255,6 +327,7 @@ class Simulator:
             show_edges=True,
             scalar_bar_args={"title": "Von Mises Stress (Pa)"},
         )
+        plotter.show_axes()
         plotter.show()
 
     def plot_vm_bottom(self, vm):
@@ -269,8 +342,64 @@ class Simulator:
         plotter.add_mesh(
             sliced,
             scalars="vm",
-            cmap="jet",
             show_edges=True,
             scalar_bar_args={"title": "Von Mises Stress (Pa)"},
         )
+        plotter.show_axes()
         plotter.show()
+
+    def plot_patch(self, loads: list[tuple[np.ndarray, np.ndarray]]):
+        all_facets = []
+        all_values = []
+
+        if len(loads) > 0:
+            contact_tags = list(range(2, 2 + len(loads)))
+            contact_positions, contact_forces = zip(*loads)
+
+            for point, force, tag in zip(
+                contact_positions, contact_forces, contact_tags
+            ):
+                _, _, triangle_id = trimesh.proximity.closest_point(
+                    self.object_mesh, [point]
+                )
+                normal = self.object_mesh.face_normals[triangle_id].flatten()
+
+                patch, tags = self.make_contact_patch(point, normal, tag)
+
+                if len(patch) > 0:
+                    all_facets.append(patch)
+                    all_values.append(tags)
+
+            if all_facets:
+                all_facets = np.concatenate(all_facets)
+                all_values = np.concatenate(all_values)
+
+                sorted_indices = np.argsort(all_facets)
+                facet_tags = mesh.meshtags(
+                    self.domain,
+                    self.fdim,
+                    all_facets[sorted_indices],
+                    all_values[sorted_indices],
+                )
+
+                topology, cell_types, geometry = plot.vtk_mesh(self.domain)
+                grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
+                cell_tags = np.zeros(grid.n_cells, dtype=np.int32)
+                f_to_c = self.domain.topology.connectivity(
+                    self.fdim, self.domain.topology.dim
+                )
+                for f_idx, val in zip(facet_tags.indices, facet_tags.values):
+                    parent_cells = f_to_c.links(f_idx)
+                    if len(parent_cells) > 0:
+                        cell_tags[parent_cells[0]] = val
+
+                grid.cell_data["facet_tags"] = cell_tags
+
+                plotter = pyvista.Plotter()
+                plotter.add_mesh(
+                    grid,
+                    scalars="facet_tags",
+                    show_edges=True,
+                    scalar_bar_args={"title": "Contact Patch Tags"},
+                )
+                plotter.show()

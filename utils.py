@@ -119,7 +119,6 @@ def visualize_graph(
         for v in contacts:
             p = v[:3]
             f = v[3:]
-            print(p, f)
 
             # Visualize the contact point
             sphere = pyvista.Sphere(radius=scale * 0.1)

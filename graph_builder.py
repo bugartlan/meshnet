@@ -1,6 +1,8 @@
 import meshio
 import numpy as np
+import pyvista as pv
 import torch
+import trimesh
 from torch_geometric.data import Data
 
 
@@ -49,7 +51,7 @@ class GraphBuilder:
     def _make_nodes(
         self,
         mesh: meshio.Mesh,
-        loads: dict[int, np.ndarray],
+        loads: list[tuple[np.ndarray, np.ndarray]],
     ) -> torch.Tensor:
         vertices = mesh.points
         num_nodes = vertices.shape[0]
@@ -141,3 +143,111 @@ class GraphBuilder:
             torch.tensor(edge_index, dtype=torch.long),
             torch.tensor(edge_attr, dtype=torch.float32),
         )
+
+
+class GraphVisualizer:
+    def __init__(self, mesh: trimesh.Trimesh, jupyter_backend: bool = True):
+        self.mesh = mesh
+        self.pv_mesh = pv.wrap(mesh)
+        self.jupyter_backend = jupyter_backend
+
+    def stress(self, graph: Data, clim: tuple = None):
+        self.pv_mesh.point_data["von_mises"] = graph.y.numpy()[:, 3]
+
+        plotter = pv.Plotter(notebook=self.jupyter_backend)
+        plotter.add_mesh(
+            self.pv_mesh,
+            scalars="von_mises",
+            point_size=1,
+            render_points_as_spheres=True,
+            show_edges=True,
+            clim=clim,
+        )
+
+        x_min, x_max, y_min, y_max, z_min, z_max = self.pv_mesh.bounds
+        scale = max(x_max - x_min, y_max - y_min, z_max - z_min) * 0.1
+
+        x = graph.x[0].cpu().numpy()
+        contacts = x[6:-1].reshape(-1, 6)
+        contacts[:, :3] -= x[:3]
+        contacts[:, :3] *= -1
+        for v in contacts:
+            p = v[:3]
+            f = v[3:]
+            print("Contact Point:", p, "Force:", f)
+
+            # Visualize the contact point
+            sphere = pv.Sphere(radius=scale * 0.1)
+            sph = sphere.translate(p, inplace=False)
+            plotter.add_mesh(sph, color="red", opacity=1)
+
+            # Visualize the force arrow
+            arrow = pv.Arrow(start=np.asarray(p), direction=f, scale=scale)
+            plotter.add_mesh(arrow, color="red")
+
+        plotter.show_axes()
+        plotter.show()
+
+    def displacement(self, graph: Data, clim: tuple = None):
+        self.pv_mesh.point_data["displacement"] = graph.y.numpy()[:, :3]
+
+        plotter = pv.Plotter(notebook=self.jupyter_backend)
+        plotter.add_mesh(
+            self.pv_mesh,
+            scalars="displacement",
+            point_size=1,
+            render_points_as_spheres=True,
+            show_edges=True,
+            clim=clim,
+        )
+
+        plotter.show_axes()
+        plotter.show()
+
+    def bottom(self, graph: Data):
+        # First, add von_mises to the full mesh
+        self.pv_mesh.point_data["von_mises"] = graph.y.numpy()[:, 3]
+
+        # Then clip the mesh with the data already assigned
+        pv_mesh_boundary = self.pv_mesh.clip(normal=(0, 0, 1), origin=(0, 0, 1e-4))
+
+        plotter = pv.Plotter(notebook=self.jupyter_backend)
+        plotter.add_mesh(
+            pv_mesh_boundary,
+            scalars="von_mises",
+            point_size=1,
+            render_points_as_spheres=True,
+            show_edges=True,
+        )
+        plotter.show_axes()
+        plotter.show()
+
+    def force(self, graph: Data):
+        self.pv_mesh.point_data["force_magnitude"] = graph.x[:, 3:6].norm(dim=1).numpy()
+
+        plotter = pv.Plotter(notebook=self.jupyter_backend)
+        plotter.add_mesh(
+            self.pv_mesh,
+            scalars="force_magnitude",
+            point_size=1,
+            render_points_as_spheres=True,
+            show_edges=True,
+        )
+
+        plotter.show_axes()
+        plotter.show()
+
+    def boundary(self, graph: Data):
+        self.pv_mesh.point_data["is_boundary"] = graph.x[:, -1].numpy()
+
+        plotter = pv.Plotter(notebook=self.jupyter_backend)
+        plotter.add_mesh(
+            self.pv_mesh,
+            scalars="is_boundary",
+            point_size=1,
+            render_points_as_spheres=True,
+            show_edges=True,
+        )
+
+        plotter.show_axes()
+        plotter.show()

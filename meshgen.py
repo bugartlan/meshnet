@@ -154,7 +154,8 @@ def main():
     if args.input.is_file():
         files = [args.input]
     elif args.input.is_dir():
-        files = list(args.input.glob(f"*.{args.format}"))
+        print("Scanning input directory for files...")
+        files = list(args.input.glob(f"*.{args.format}", case_sensitive=False))
     else:
         raise RuntimeError(f"Input path {args.input} is not a file or directory.")
 

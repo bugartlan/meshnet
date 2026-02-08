@@ -14,7 +14,6 @@ from utils import (
     msh_to_trimesh,
     strain_stress_vm,
     visualize_graph,
-    visualize_graph_bottom,
 )
 
 ################################ Material Properties ###################################
@@ -109,7 +108,7 @@ def main():
     dataset_path = Path("data") / f"{args.dataset}.pt"
     data = torch.load(dataset_path, weights_only=False)
     graphs = [g.to(device) for g in data["graphs"]]
-    mesh_name = data["mesh"]
+    msh_path = data["mesh"]
 
     model_path = Path("models") / f"{args.checkpoint}.pth"
     checkpoint = torch.load(
@@ -196,9 +195,6 @@ def main():
         n_samples = min(args.n, len(graphs_pred))
         idx = rng.choice(len(graphs_pred), size=n_samples, replace=False)
 
-        is_coarse = args.dataset.endswith("_c")
-        msh_subdir = "msh_coarse" if is_coarse else "msh"
-        msh_path = args.mesh_dir / msh_subdir / f"{mesh_name}.msh"
         mesh = msh_to_trimesh(meshio.read(msh_path))
 
         show_forces = args.mode != "bottom"
@@ -225,11 +221,11 @@ def main():
                 # Generate filenames
                 filename_true = (
                     args.plot_dir
-                    / f"{mesh_name}_smpl{i}_true_{label_name}{suffix}.html"
+                    / f"{msh_path.stem}_smpl{i}_true_{label_name}{suffix}.html"
                 )
                 filename_pred = (
                     args.plot_dir
-                    / f"{mesh_name}_smpl{i}_pred_{label_name}{suffix}.html"
+                    / f"{msh_path.stem}_smpl{i}_pred_{label_name}{suffix}.html"
                 )
 
                 # Visualize ground truth and prediction
@@ -252,7 +248,7 @@ def main():
                     filename=filename_pred,
                 )
 
-            print(f"Saved plots for sample {i} ({mesh_name}).")
+            print(f"Saved plots for sample {i} ({msh_path.stem}).")
 
 
 if __name__ == "__main__":

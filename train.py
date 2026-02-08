@@ -181,7 +181,8 @@ def main():
     writer = None
     if args.tensorboard:
         model_name = (
-            args.model_name if args.model_name
+            args.model_name
+            if args.model_name
             else f"{args.dataset}_{args.target}_{'w' if args.weighted_loss else 'uw'}"
         )
         log_path = args.log_dir / model_name
@@ -220,12 +221,12 @@ def main():
 
         avg_loss = total_loss / total_nodes
         loss_history.append(avg_loss)
-        
+
         # Log to TensorBoard
         if writer is not None:
-            writer.add_scalar('Loss/train', avg_loss, epoch)
-            writer.add_scalar('Learning_Rate', scheduler.get_last_lr()[0], epoch)
-        
+            writer.add_scalar("Loss/train", avg_loss, epoch)
+            writer.add_scalar("Learning_Rate", scheduler.get_last_lr()[0], epoch)
+
         if (epoch + 1) % 50 == 0:
             tqdm.write(f"Epoch {epoch + 1}/{args.num_epochs}, Loss: {avg_loss:.6f}")
 
