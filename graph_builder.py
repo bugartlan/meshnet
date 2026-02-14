@@ -151,7 +151,13 @@ class GraphVisualizer:
         self.pv_mesh = pv.wrap(mesh)
         self.jupyter_backend = jupyter_backend
 
-    def stress(self, graph: Data, clim: tuple = None):
+    def stress(
+        self,
+        graph: Data,
+        clim: tuple = None,
+        save_path: str | None = None,
+        debug: bool = False,
+    ):
         self.pv_mesh.point_data["von_mises"] = graph.y.numpy()[:, 3]
 
         plotter = pv.Plotter(notebook=self.jupyter_backend)
@@ -174,8 +180,8 @@ class GraphVisualizer:
         for v in contacts:
             p = v[:3]
             f = v[3:]
-            print("Contact Point:", p, "Force:", f)
-
+            if debug:
+                print(f"Contact point: {p}, Force: {f}")
             # Visualize the contact point
             sphere = pv.Sphere(radius=scale * 0.1)
             sph = sphere.translate(p, inplace=False)
@@ -186,9 +192,14 @@ class GraphVisualizer:
             plotter.add_mesh(arrow, color="red")
 
         plotter.show_axes()
-        plotter.show()
+        if save_path is not None:
+            plotter.export_html(save_path)
+        else:
+            plotter.show()
 
-    def displacement(self, graph: Data, clim: tuple = None):
+    def displacement(
+        self, graph: Data, clim: tuple = None, save_path: str | None = None
+    ):
         self.pv_mesh.point_data["displacement"] = graph.y.numpy()[:, :3]
 
         plotter = pv.Plotter(notebook=self.jupyter_backend)
@@ -202,14 +213,17 @@ class GraphVisualizer:
         )
 
         plotter.show_axes()
-        plotter.show()
+        if save_path is not None:
+            plotter.export_html(save_path)
+        else:
+            plotter.show()
 
-    def bottom(self, graph: Data):
+    def bottom(self, graph: Data, clim: tuple = None, save_path: str | None = None):
         # First, add von_mises to the full mesh
         self.pv_mesh.point_data["von_mises"] = graph.y.numpy()[:, 3]
 
         # Then clip the mesh with the data already assigned
-        pv_mesh_boundary = self.pv_mesh.clip(normal=(0, 0, 1), origin=(0, 0, 1e-4))
+        pv_mesh_boundary = self.pv_mesh.clip(normal=(0, 0, 1), origin=(0, 0, 1e-6))
 
         plotter = pv.Plotter(notebook=self.jupyter_backend)
         plotter.add_mesh(
@@ -218,9 +232,13 @@ class GraphVisualizer:
             point_size=1,
             render_points_as_spheres=True,
             show_edges=True,
+            clim=clim,
         )
         plotter.show_axes()
-        plotter.show()
+        if save_path is not None:
+            plotter.export_html(save_path)
+        else:
+            plotter.show()
 
     def force(self, graph: Data):
         self.pv_mesh.point_data["force_magnitude"] = graph.x[:, 3:6].norm(dim=1).numpy()

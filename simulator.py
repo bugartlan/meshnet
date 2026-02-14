@@ -3,7 +3,7 @@ import numpy as np
 import pyvista
 import trimesh
 import ufl
-from dolfinx import default_scalar_type, fem, mesh, plot
+from dolfinx import default_scalar_type, fem, geometry, mesh, plot
 from dolfinx.fem.petsc import apply_lifting, assemble_matrix, assemble_vector, set_bc
 from dolfinx.io import gmshio
 from mpi4py import MPI
@@ -267,38 +267,48 @@ class Simulator:
         vm1.x.scatter_forward()
         return vm1
 
-    def compute_vm(self, uh):
-        V = fem.functionspace(self.domain, ("CG", 1))
-        s = self.sigma(uh) - 1.0 / 3 * ufl.tr(self.sigma(uh)) * ufl.Identity(len(uh))
-        vm_expr = ufl.sqrt(1.5 * ufl.inner(s, s))
+    # def probe(self, func: fem.Function, points: np.ndarray) -> np.ndarray:
+    #     """
+    #     Probe the function `func` at the given `points`.
+    #     This method uses PyVista to interpolate the function values at the specified points.
+    #     """
+    #     topology, cell_types, geometry = plot.vtk_mesh(func.function_space)
+    #     grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
+    #     bs = func.function_space.dofmap.index_map_bs
+    #     grid.point_data["values"] = func.x.array.real.reshape(-1, bs)
+    #     cloud = pyvista.PolyData(points)
+    #     samples = cloud.interpolate(grid, sharpness=20)
+    #     # samples = cloud.sample(grid)
 
-        u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
-        a = ufl.inner(u, v) * ufl.dx
-        L = ufl.inner(vm_expr, v) * ufl.dx
-
-        A = assemble_matrix(fem.form(a))
-        A.assemble()
-        b = assemble_vector(fem.form(L))
-
-        solver = PETSc.KSP().create(self.comm)
-        solver.setOperators(A)
-        solver.setType("preonly")
-        solver.getPC().setType("lu")
-
-        vm = fem.Function(V)
-        solver.solve(b, vm.x.petsc_vec)
-        vm.x.scatter_forward()
-        return vm
+    #     return samples.point_data["values"].reshape(-1, bs)
 
     def probe(self, func: fem.Function, points: np.ndarray) -> np.ndarray:
-        topology, cell_types, geometry = plot.vtk_mesh(func.function_space)
-        grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
-        bs = func.function_space.dofmap.index_map_bs
-        grid.point_data["values"] = func.x.array.real.reshape(-1, bs)
-        cloud = pyvista.PolyData(points)
-        samples = cloud.sample(grid, tolerance=1e-5)
+        # Find cells containing points
+        bb_tree = geometry.bb_tree(self.domain, self.domain.topology.dim)
+        cells = []
+        points_on_proc = []
 
-        return samples.point_data["values"].reshape(-1, bs)
+        # Determine which points are on this processor
+        cell_candidates = geometry.compute_collisions_points(bb_tree, points)
+
+        colliding_cells = geometry.compute_colliding_cells(
+            self.domain, cell_candidates, points
+        )
+
+        for i, point in enumerate(points):
+            if len(colliding_cells.links(i)) > 0:
+                points_on_proc.append(point)
+                cells.append(colliding_cells.links(i)[0])
+
+        points_on_proc = np.array(points_on_proc)
+
+        # Evaluate function at points
+        if len(points_on_proc) > 0:
+            values = func.eval(points_on_proc, cells)
+        else:
+            values = np.array([])
+
+        return values
 
     def plot_displacement(self, uh):
         topology, cell_types, geometry = plot.vtk_mesh(uh.function_space)

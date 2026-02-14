@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from graph_builder import GraphVisualizer
 from nets import EncodeProcessDecode
 from normalizer import LogNormalizer, Normalizer
 from utils import (
@@ -13,7 +14,6 @@ from utils import (
     make_pv_mesh,
     msh_to_trimesh,
     strain_stress_vm,
-    visualize_graph,
 )
 
 ################################ Material Properties ###################################
@@ -37,12 +37,6 @@ def parse_args():
         type=str,
         default="cantilever_1_10",
         help="Name of the graph dataset file (no extension).",
-    )
-    p.add_argument(
-        "--mesh-dir",
-        type=Path,
-        default=Path("meshes/cantilever"),
-        help="Directory containing original .msh files. for visualization.",
     )
 
     # --- Evaluation Configuration ---
@@ -105,14 +99,14 @@ def main():
 
     device = torch.device(args.device)
 
-    dataset_path = Path("data") / f"{args.dataset}.pt"
-    data = torch.load(dataset_path, weights_only=False)
+    data = torch.load(f"data/{args.dataset}.pt", weights_only=False)
     graphs = [g.to(device) for g in data["graphs"]]
     msh_path = data["mesh"]
 
-    model_path = Path("models") / f"{args.checkpoint}.pth"
     checkpoint = torch.load(
-        model_path, map_location=torch.device("cpu"), weights_only=True
+        f"models/{args.checkpoint}.pth",
+        map_location=torch.device("cpu"),
+        weights_only=True,
     )
     model_state_dict = checkpoint["model_state_dict"]
     params = checkpoint["params"]
@@ -194,59 +188,26 @@ def main():
 
         n_samples = min(args.n, len(graphs_pred))
         idx = rng.choice(len(graphs_pred), size=n_samples, replace=False)
+        visualizer = GraphVisualizer(
+            msh_to_trimesh(meshio.read(msh_path)), jupyter_backend=False
+        )
 
-        mesh = msh_to_trimesh(meshio.read(msh_path))
-
-        show_forces = args.mode != "bottom"
         suffix = "_bottom" if args.mode == "bottom" else ""
 
         for i in range(n_samples):
             g_true = graphs[idx[i]].cpu()
             g_pred = graphs_pred[idx[i]].cpu()
 
-            pv_mesh_true = make_pv_mesh(mesh, g_true, labels)
-            pv_mesh_pred = make_pv_mesh(mesh, g_pred, labels)
+            filename_true = args.plot_dir / f"{msh_path.stem}_smpl{i}_true{suffix}.html"
+            filename_pred = args.plot_dir / f"{msh_path.stem}_smpl{i}_pred{suffix}.html"
 
+            # Visualize ground truth and prediction
             if args.mode == "bottom":
-                pv_mesh_true = pv_mesh_true.clip(normal=(0, 0, 1), origin=(0, 0, 1e-4))
-                pv_mesh_pred = pv_mesh_pred.clip(normal=(0, 0, 1), origin=(0, 0, 1e-4))
-
-            for j in target_indices:
-                label = labels[j]
-                label_name = label.replace(" ", "_")
-
-                # Calculate shared color limits from ground truth
-                clim = (pv_mesh_true[label].min(), pv_mesh_true[label].max())
-
-                # Generate filenames
-                filename_true = (
-                    args.plot_dir
-                    / f"{msh_path.stem}_smpl{i}_true_{label_name}{suffix}.html"
-                )
-                filename_pred = (
-                    args.plot_dir
-                    / f"{msh_path.stem}_smpl{i}_pred_{label_name}{suffix}.html"
-                )
-
-                # Visualize ground truth and prediction
-                visualize_graph(
-                    pv_mesh_true,
-                    g_true,
-                    label=label,
-                    show=False,
-                    force_arrows=show_forces,
-                    clim=clim,
-                    filename=filename_true,
-                )
-                visualize_graph(
-                    pv_mesh_pred,
-                    g_pred,
-                    label=label,
-                    show=False,
-                    force_arrows=show_forces,
-                    clim=clim,
-                    filename=filename_pred,
-                )
+                visualizer.bottom(g_true, save_path=filename_true)
+                visualizer.bottom(g_pred, save_path=filename_pred)
+            else:
+                visualizer.stress(g_true, save_path=filename_true)
+                visualizer.stress(g_pred, save_path=filename_pred)
 
             print(f"Saved plots for sample {i} ({msh_path.stem}).")
 

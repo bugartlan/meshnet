@@ -114,7 +114,7 @@ class DataGenerator:
         for p, f in tqdm(zip(points, forces)):
             contacts = list(zip(p, f * self.force_max))
             uh = simulator.run(contacts)
-            vm = simulator.compute_vm(uh)
+            vm = simulator.compute_vm1(uh)
             results.append(
                 np.hstack([simulator.probe(uh, queries), simulator.probe(vm, queries)])
             )
