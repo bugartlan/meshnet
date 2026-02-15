@@ -16,4 +16,5 @@ dependencies:
   - rtree
   - pyglet<2
   - meshio
+  - tensorboard
 prefix: /Users/bugart/miniconda3/envs/meshnet
