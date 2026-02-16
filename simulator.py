@@ -27,6 +27,7 @@ class Simulator:
 
         # Function space
         element_order = self.domain.geometry.cmap.degree
+        print(f"Using Lagrange elements of order {element_order} for simulation.")
         self.V = fem.functionspace(
             self.domain, ("Lagrange", element_order, (self.domain.geometry.dim,))
         )
@@ -77,40 +78,6 @@ class Simulator:
             self.epsilon(u)
         ) * ufl.Identity(len(u))
 
-    def compute_facet_normals(self, facets):
-        if len(facets) == 0:
-            return np.empty((0, 3))
-
-        facet_nodes = mesh.entities_to_geometry(self.domain, self.fdim, facets)
-        coords = self.domain.geometry.x[facet_nodes]
-
-        vec1 = coords[:, 1] - coords[:, 0]
-        vec2 = coords[:, 2] - coords[:, 0]
-        normals = np.cross(vec1, vec2)
-        norms = np.linalg.norm(normals, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0  # Prevent division by zero
-        return normals / norms
-
-    def make_contact_patch(self, x, normal, tag):
-        x = np.asarray(x)
-
-        candidate_facets = mesh.locate_entities_boundary(
-            self.domain,
-            self.fdim,
-            lambda y: np.linalg.norm(y.T - x, axis=1) < self.contact_radius,
-        )
-
-        candidate_normals = self.compute_facet_normals(candidate_facets)
-
-        # Align normals
-        dots = candidate_normals @ normal
-        candidate_normals[dots < 0] *= -1.0
-        mask = np.dot(candidate_normals, normal) > 0.5  # within ~60 degrees
-        final_facets = candidate_facets[mask]
-        values = np.full(final_facets.shape, tag, dtype=np.int32)
-
-        return final_facets, values
-
     def run(self, loads: list[tuple[np.ndarray, np.ndarray]]):
         x = ufl.SpatialCoordinate(self.domain)
 
@@ -150,74 +117,6 @@ class Simulator:
         uh.x.scatter_forward()
 
         return uh
-
-    # def run(self, loads: list[tuple[np.ndarray, np.ndarray]]):
-    #     L_form = (
-    #         ufl.dot(
-    #             fem.Constant(self.domain, default_scalar_type((0.0, 0.0, 0.0))), self.v
-    #         )
-    #         * ufl.dx
-    #     )
-
-    #     all_facets = []
-    #     all_values = []
-    #     active_loads = []
-
-    #     if len(loads) > 0:
-    #         contact_tags = list(range(2, 2 + len(loads)))
-    #         contact_positions, contact_forces = zip(*loads)
-
-    #         for point, force, tag in zip(
-    #             contact_positions, contact_forces, contact_tags
-    #         ):
-    #             _, _, triangle_id = trimesh.proximity.closest_point(
-    #                 self.object_mesh, [point]
-    #             )
-    #             normal = self.object_mesh.face_normals[triangle_id].flatten()
-
-    #             patch, tags = self.make_contact_patch(point, normal, tag)
-
-    #             if len(patch) > 0:
-    #                 all_facets.append(patch)
-    #                 all_values.append(tags)
-    #                 active_loads.append((force, tag))
-
-    #         if all_facets:
-    #             all_facets = np.concatenate(all_facets)
-    #             all_values = np.concatenate(all_values)
-
-    #             sorted_indices = np.argsort(all_facets)
-    #             facet_tags = mesh.meshtags(
-    #                 self.domain,
-    #                 self.fdim,
-    #                 all_facets[sorted_indices],
-    #                 all_values[sorted_indices],
-    #             )
-
-    #             ds = ufl.Measure("ds", self.domain, subdomain_data=facet_tags)
-
-    #             for force, tag in active_loads:
-    #                 area = fem.assemble_scalar(fem.form(1.0 * ds(tag)))
-    #                 if area > 1e-12:
-    #                     T = fem.Constant(
-    #                         self.domain, default_scalar_type(np.array(force) / area)
-    #                     )
-    #                     L_form += ufl.dot(T, self.v) * ds(tag)
-
-    #     L_compiled = fem.form(L_form)
-    #     b = assemble_vector(L_compiled)
-
-    #     # Apply BC to RHS
-    #     apply_lifting(b, [self.bilinear_form], bcs=[[self.bc]])
-    #     b.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
-    #     set_bc(b, [self.bc])
-
-    #     # Solve linear system
-    #     uh = fem.Function(self.V)
-    #     self.solver.solve(b, uh.x.petsc_vec)
-    #     uh.x.scatter_forward()
-
-    #     return uh
 
     def compute_vm0(self, uh):
         V = fem.functionspace(self.domain, ("DG", 0))
@@ -283,32 +182,85 @@ class Simulator:
     #     return samples.point_data["values"].reshape(-1, bs)
 
     def probe(self, func: fem.Function, points: np.ndarray) -> np.ndarray:
-        # Find cells containing points
+        points = np.asarray(points, dtype=np.float64)
+        n_points = len(points)
+        bs = func.function_space.dofmap.index_map_bs
+
+        # Always return one value per query point.
+        values = np.zeros((n_points, bs), dtype=np.float64)
+        found = np.zeros(n_points, dtype=bool)
+
+        # First pass: direct FE evaluation at points with colliding cells.
         bb_tree = geometry.bb_tree(self.domain, self.domain.topology.dim)
-        cells = []
-        points_on_proc = []
-
-        # Determine which points are on this processor
         cell_candidates = geometry.compute_collisions_points(bb_tree, points)
-
         colliding_cells = geometry.compute_colliding_cells(
             self.domain, cell_candidates, points
         )
 
+        eval_idx = []
+        eval_points = []
+        eval_cells = []
         for i, point in enumerate(points):
-            if len(colliding_cells.links(i)) > 0:
-                points_on_proc.append(point)
-                cells.append(colliding_cells.links(i)[0])
+            links = colliding_cells.links(i)
+            if len(links) > 0:
+                eval_idx.append(i)
+                eval_points.append(point)
+                eval_cells.append(links[0])
 
-        points_on_proc = np.array(points_on_proc)
+        if len(eval_points) > 0:
+            eval_values = func.eval(np.asarray(eval_points), np.asarray(eval_cells))
+            values[np.asarray(eval_idx)] = eval_values
+            found[np.asarray(eval_idx)] = True
 
-        # Evaluate function at points
-        if len(points_on_proc) > 0:
-            values = func.eval(points_on_proc, cells)
-        else:
-            values = np.array([])
+        # Second pass: project misses to closest surface and nudge inward.
+        missing_idx = np.where(~found)[0]
+        if len(missing_idx) > 0:
+            missing_points = points[missing_idx]
+            closest_points, _, triangle_id = self.query.on_surface(missing_points)
 
-        return values
+            normals = self.object_mesh.face_normals[np.asarray(triangle_id).ravel()]
+            bbox = self.domain.geometry.x
+            bbox_diag = np.linalg.norm(bbox.max(axis=0) - bbox.min(axis=0))
+            eps = max(1e-12, 1e-7 * bbox_diag)
+            projected_points = closest_points - eps * normals
+
+            proj_candidates = geometry.compute_collisions_points(
+                bb_tree, projected_points
+            )
+            proj_colliding = geometry.compute_colliding_cells(
+                self.domain, proj_candidates, projected_points
+            )
+
+            proj_idx = []
+            proj_points = []
+            proj_cells = []
+            for local_i, global_i in enumerate(missing_idx):
+                links = proj_colliding.links(local_i)
+                if len(links) > 0:
+                    proj_idx.append(global_i)
+                    proj_points.append(projected_points[local_i])
+                    proj_cells.append(links[0])
+
+            if len(proj_points) > 0:
+                proj_values = func.eval(np.asarray(proj_points), np.asarray(proj_cells))
+                values[np.asarray(proj_idx)] = proj_values
+                found[np.asarray(proj_idx)] = True
+
+        # Final fallback: interpolate from nodal values (guarantees no missing labels).
+        missing_idx = np.where(~found)[0]
+        if len(missing_idx) > 0:
+            topology, cell_types, geom = plot.vtk_mesh(func.function_space)
+            grid = pyvista.UnstructuredGrid(topology, cell_types, geom)
+            grid.point_data["values"] = func.x.array.real.reshape(-1, bs)
+
+            cloud = pyvista.PolyData(points[missing_idx])
+            radius = 2.0 * np.linalg.norm(
+                self.domain.geometry.x.max(axis=0) - self.domain.geometry.x.min(axis=0)
+            )
+            sampled = cloud.interpolate(grid, radius=radius, sharpness=1.0)
+            values[missing_idx] = sampled.point_data["values"].reshape(-1, bs)
+
+        return values.clip(min=0.0)  # Ensure non-negative values
 
     def plot_displacement(self, uh):
         topology, cell_types, geometry = plot.vtk_mesh(uh.function_space)
@@ -357,59 +309,3 @@ class Simulator:
         )
         plotter.show_axes()
         plotter.show()
-
-    def plot_patch(self, loads: list[tuple[np.ndarray, np.ndarray]]):
-        all_facets = []
-        all_values = []
-
-        if len(loads) > 0:
-            contact_tags = list(range(2, 2 + len(loads)))
-            contact_positions, contact_forces = zip(*loads)
-
-            for point, force, tag in zip(
-                contact_positions, contact_forces, contact_tags
-            ):
-                _, _, triangle_id = trimesh.proximity.closest_point(
-                    self.object_mesh, [point]
-                )
-                normal = self.object_mesh.face_normals[triangle_id].flatten()
-
-                patch, tags = self.make_contact_patch(point, normal, tag)
-
-                if len(patch) > 0:
-                    all_facets.append(patch)
-                    all_values.append(tags)
-
-            if all_facets:
-                all_facets = np.concatenate(all_facets)
-                all_values = np.concatenate(all_values)
-
-                sorted_indices = np.argsort(all_facets)
-                facet_tags = mesh.meshtags(
-                    self.domain,
-                    self.fdim,
-                    all_facets[sorted_indices],
-                    all_values[sorted_indices],
-                )
-
-                topology, cell_types, geometry = plot.vtk_mesh(self.domain)
-                grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
-                cell_tags = np.zeros(grid.n_cells, dtype=np.int32)
-                f_to_c = self.domain.topology.connectivity(
-                    self.fdim, self.domain.topology.dim
-                )
-                for f_idx, val in zip(facet_tags.indices, facet_tags.values):
-                    parent_cells = f_to_c.links(f_idx)
-                    if len(parent_cells) > 0:
-                        cell_tags[parent_cells[0]] = val
-
-                grid.cell_data["facet_tags"] = cell_tags
-
-                plotter = pyvista.Plotter()
-                plotter.add_mesh(
-                    grid,
-                    scalars="facet_tags",
-                    show_edges=True,
-                    scalar_bar_args={"title": "Contact Patch Tags"},
-                )
-                plotter.show()

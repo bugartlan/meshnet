@@ -20,6 +20,11 @@ class GraphBuilder:
         radius: float = 1.0,
         contacts: list[tuple] | None = None,
     ) -> Data:
+        if y.shape[0] != mesh.points.shape[0]:
+            raise ValueError(
+                f"Output array y must have shape [num_nodes, num_output_features], but got {y.shape} and {mesh.points.shape[0]} nodes."
+            )
+
         # Node feature matrix with shape [num_nodes, num_node_features]
         x = self._make_nodes(mesh, contacts)
         y = torch.tensor(y, dtype=torch.float32)
@@ -198,7 +203,11 @@ class GraphVisualizer:
             plotter.show()
 
     def displacement(
-        self, graph: Data, clim: tuple = None, save_path: str | None = None
+        self,
+        graph: Data,
+        clim: tuple = None,
+        save_path: str | None = None,
+        debug: bool = False,
     ):
         self.pv_mesh.point_data["displacement"] = graph.y.numpy()[:, :3]
 
