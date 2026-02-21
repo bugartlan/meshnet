@@ -110,16 +110,19 @@ def main():
     model_state_dict = checkpoint["model_state_dict"]
     params = checkpoint["params"]
 
-    normalizer = LogNormalizer(
-        num_features=params["node_dim"], device=device, stats=checkpoint["stats"]
-    )
     if checkpoint["normalizer"] == "LogNormalizer":
         normalizer = LogNormalizer(
-            num_features=params["node_dim"], device=device, stats=checkpoint["stats"]
+            num_features=params["node_dim"],
+            num_categorical=params["num_categorical"],
+            device=device,
+            stats=checkpoint["stats"],
         )
     else:
         normalizer = Normalizer(
-            num_features=params["node_dim"], device=device, stats=checkpoint["stats"]
+            num_features=params["node_dim"],
+            num_categorical=params["num_categorical"],
+            device=device,
+            stats=checkpoint["stats"],
         )
 
     model = EncodeProcessDecode(

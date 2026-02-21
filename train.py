@@ -152,10 +152,12 @@ def load_graphs_and_params(dataset_name: str) -> tuple[list[Any], dict[str, Any]
     return graphs, params, dataset_path
 
 
-def build_normalizer(use_log_loss: bool, node_dim: int):
+def build_normalizer(
+    use_log_loss: bool, num_features: int, num_categorical: int
+) -> Normalizer:
     if use_log_loss:
-        return LogNormalizer(num_features=node_dim)
-    return Normalizer(num_features=node_dim)
+        return LogNormalizer(num_features=num_features, num_categorical=num_categorical)
+    return Normalizer(num_features=num_features, num_categorical=num_categorical)
 
 
 def get_target_indices(target: str) -> list[int]:
@@ -169,18 +171,24 @@ def get_target_indices(target: str) -> list[int]:
     return targets[target]
 
 
-def prepare_graphs(graphs, normalizer, weighted_loss: bool, alpha: float, num_targets: int):
+def prepare_graphs(
+    graphs, normalizer, weighted_loss: bool, alpha: float, num_targets: int
+):
     mode = "weighted" if weighted_loss else "all"
     normalized_graphs = []
 
     for graph in graphs:
         graph_norm = normalizer.normalize(graph)
-        graph_norm.weight = get_weight(
+        weight = get_weight(
             graph.x[:, 2],
             num_targets,
             mode=mode,
             alpha=alpha,
         )
+
+        # Only weight physical nodes, not virtual nodes
+        weight = weight * (graph.x[:, -1] != 1.0).unsqueeze(1).float()
+        graph_norm.weight = weight
         normalized_graphs.append(graph_norm)
 
     return normalized_graphs
@@ -219,6 +227,7 @@ def train_model(
             batch = batch.to(device)
             optimizer.zero_grad()
 
+            # TODO
             y_true = batch.y[:, target_indices]
             autocast_ctx = (
                 torch.autocast(device_type="cuda", dtype=torch.float16)
@@ -267,6 +276,7 @@ def save_checkpoint(
                 "latent_dim": LATENT_DIM,
                 "message_passing_steps": args.layers,
                 "use_layer_norm": USE_LAYER_NORM,
+                "num_categorical": params["num_categorical"],
             },
             "normalizer": normalizer.__class__.__name__,
             "stats": normalizer.stats,
@@ -301,7 +311,9 @@ def main():
     print(f"Using device: {device}")
     print(f"Loaded dataset from: {dataset_path}")
 
-    normalizer = build_normalizer(args.log_loss, params["node_dim"])
+    normalizer = build_normalizer(
+        args.log_loss, params["node_dim"], params["num_categorical"]
+    )
     normalizer.fit(graphs)
 
     target_indices = get_target_indices(args.target)

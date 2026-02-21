@@ -43,6 +43,15 @@ class Processor(nn.Module):
         # Update nodes
         agg_edges = self._aggregate_edges(g.edge_index, edge_attr, g.x.size(0))
 
+        # Global context via max pooling
+        # batch = (
+        #     g.batch
+        #     if hasattr(g, "batch") and g.batch is not None
+        #     else torch.zeros(g.x.size(0), dtype=torch.long, device=g.x.device)
+        # )
+        # global_context = global_max_pool(g.x, batch)  # Shape: [num_graphs, dim]
+        # global_expanded = global_context[batch]  # Shape: [num_nodes, dim]
+
         node_cat = torch.cat([g.x, agg_edges], dim=-1)
         node_delta = self.node_mlp(node_cat)
         x = g.x + node_delta

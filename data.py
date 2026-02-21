@@ -8,7 +8,7 @@ import torch
 import trimesh
 from tqdm import tqdm
 
-from graph_builder import GraphBuilder, GraphBuilderLocal
+from graph_builder import GraphBuilderAugment, GraphBuilderBase, GraphBuilderVirtual
 from simulator import Simulator
 from utils import info, msh_to_trimesh
 
@@ -49,7 +49,7 @@ class DataGenerator:
         self.rng = np.random.default_rng(seed)
 
         # self.builder = GraphBuilder(std=sigma)
-        self.builder = GraphBuilderLocal(std=sigma)
+        self.builder = GraphBuilderVirtual(std=sigma)
 
     def process(self, msh_path: Path):
         """Strategy: CG1 mesh for graph construction and CG2 mesh for simulation accuracy."""
@@ -185,12 +185,14 @@ def main():
         out_path = args.out_dir / (f.stem.replace("cg1", f"{args.num_samples}") + ".pt")
 
         node_dim, edge_dim, output_dim = info(graphs[0])
+        num_categorical = generator.builder.num_categorical
         torch.save(
             {
                 "params": {
                     "node_dim": node_dim,
                     "edge_dim": edge_dim,
                     "output_dim": output_dim,
+                    "num_categorical": num_categorical,
                 },
                 "graphs": graphs,
                 "mesh": f,

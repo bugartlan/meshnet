@@ -3,18 +3,27 @@ from torch_geometric.data import Data
 
 
 class Normalizer:
-    def __init__(self, num_features: int, device: str = "cpu", stats: dict = None):
+    def __init__(
+        self,
+        num_features: int,
+        num_categorical: int = 1,
+        device: str = "cpu",
+        stats: dict = None,
+    ):
         self.num_features = num_features
         self.device = device
-
         self.stats = self.load(stats)
 
-        idx_mod = torch.arange(num_features) % 6
-        self.pos_mask = idx_mod < 3
-        self.force_mask = ~self.pos_mask
-        self.pos_mask[-1] = False  # Exclude boundary mask
+        numeric_features = num_features - num_categorical
+        idx_mod = torch.arange(numeric_features) % 6
 
-        self.F_MAX = 10.0  # Max force for normalization
+        self.pos_mask = torch.zeros(num_features, dtype=torch.bool)
+        self.force_mask = torch.zeros(num_features, dtype=torch.bool)
+
+        self.pos_mask[:numeric_features] = idx_mod < 3
+        self.force_mask[:numeric_features] = ~(idx_mod < 3)
+
+        self.F_MAX = 1.0  # Max force for normalization
 
     def fit(self, graphs: list[Data]):
         all_pos = torch.cat([g.x[:, :3] for g in graphs], dim=0)
