@@ -8,7 +8,7 @@ import torch
 import trimesh
 from tqdm import tqdm
 
-from graph_builder import GraphBuilder
+from graph_builder import GraphBuilder, GraphBuilderLocal
 from simulator import Simulator
 from utils import info, msh_to_trimesh
 
@@ -48,7 +48,8 @@ class DataGenerator:
 
         self.rng = np.random.default_rng(seed)
 
-        self.builder = GraphBuilder(contact_radius=contact_radius, std=sigma)
+        # self.builder = GraphBuilder(std=sigma)
+        self.builder = GraphBuilderLocal(std=sigma)
 
     def process(self, msh_path: Path):
         """Strategy: CG1 mesh for graph construction and CG2 mesh for simulation accuracy."""
@@ -63,14 +64,12 @@ class DataGenerator:
         mesh_cg2 = meshio.read(msh_path_cg2)
 
         points, forces = self._sample(mesh_cg2)
+        # results = self._simulate(msh_path_cg1, points, forces, mesh_cg1.points)
         results = self._simulate(msh_path_cg2, points, forces, mesh_cg1.points)
 
         graphs = []
         for y, p, f in zip(results, points, forces):
-            graph = self.builder.build(
-                mesh_cg1, y, radius=self.contact_radius, contacts=list(zip(p, f))
-            )
-            graphs.append(graph)
+            graphs.append(self.builder.build(mesh_cg1, y, contacts=list(zip(p, f))))
 
         return graphs
 
@@ -80,10 +79,10 @@ class DataGenerator:
         # Sample 2x buffer to account for filtering
         mesh = msh_to_trimesh(mesh)
         candidates, _ = trimesh.sample.sample_surface(
-            mesh, count=num_total_points * 2, seed=self.seed
+            mesh, count=num_total_points * 3, seed=self.seed
         )
         # Remove point near bottom (z=0)
-        candidates = candidates[candidates[:, 2] > 0.005]
+        candidates = candidates[candidates[:, 2] > 0.002]
         candidates = candidates[:num_total_points]
 
         if len(candidates) < num_total_points:

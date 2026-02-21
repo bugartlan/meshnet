@@ -11,7 +11,6 @@ from nets import EncodeProcessDecode
 from normalizer import LogNormalizer, Normalizer
 from utils import (
     get_weight,
-    make_pv_mesh,
     msh_to_trimesh,
     strain_stress_vm,
 )

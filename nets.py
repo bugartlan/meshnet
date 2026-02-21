@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch_geometric.data import Data
+from torch_geometric.nn import global_max_pool
 
 
 def make_mlp(input_dim, hidden_dim, output_dim, layer_norm):
@@ -30,12 +31,6 @@ class Processor(nn.Module):
         D = edge_attr.size(1)
         idx = edge_index[1].unsqueeze(-1).expand(-1, D)
         agg = torch.zeros((num_nodes, D), device=device, dtype=dtype)
-        # deg = torch.zeros((num_nodes, 1), device=device, dtype=dtype)
-        # deg.scatter_add_(
-        #     0,
-        #     edge_index[1].unsqueeze(-1),
-        #     torch.ones((edge_index.size(1), 1), device=device, dtype=dtype),
-        # ).clamp_(min=1.0)
         return torch.scatter_add(agg, 0, idx, edge_attr)
 
     def forward(self, g: Data) -> Data:
@@ -47,6 +42,7 @@ class Processor(nn.Module):
 
         # Update nodes
         agg_edges = self._aggregate_edges(g.edge_index, edge_attr, g.x.size(0))
+
         node_cat = torch.cat([g.x, agg_edges], dim=-1)
         node_delta = self.node_mlp(node_cat)
         x = g.x + node_delta
