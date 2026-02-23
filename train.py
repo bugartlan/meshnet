@@ -219,7 +219,7 @@ def train_model(
     loss_history = []
     use_amp = device.type == "cuda"
 
-    for epoch in tqdm(range(num_epochs)):
+    for epoch in tqdm(range(num_epochs), dynamic_ncols=True):
         total_loss = 0.0
         total_nodes = 0
 
@@ -227,16 +227,17 @@ def train_model(
             batch = batch.to(device)
             optimizer.zero_grad()
 
-            # TODO
             y_true = batch.y[:, target_indices]
             autocast_ctx = (
-                torch.autocast(device_type="cuda", dtype=torch.float16)
+                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                 if use_amp
                 else nullcontext()
             )
             with autocast_ctx:
                 y_pred = model(batch)[:, target_indices]
                 loss = F.mse_loss(y_pred, y_true, weight=batch.weight)
+                if torch.isnan(loss):
+                    raise ValueError("Loss is NaN. Check data and model for issues.")
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
