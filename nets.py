@@ -95,3 +95,35 @@ class EncodeProcessDecode(nn.Module):
         for _ in range(self._message_passing_steps):
             g = self._processor(g)
         return self._decoder(g.x)
+
+
+class MeshGraphNet(EncodeProcessDecode):
+    def __init__(
+        self,
+        node_dim,
+        edge_dim,
+        output_dim,
+        latent_dim=128,
+        message_passing_steps=10,
+        use_layer_norm=False,
+    ):
+        super().__init__(
+            node_dim,
+            edge_dim,
+            output_dim,
+            latent_dim,
+            message_passing_steps,
+            use_layer_norm,
+        )
+        self._processor = nn.ModuleList(
+            [
+                Processor(latent_dim, layer_norm=use_layer_norm)
+                for _ in range(message_passing_steps)
+            ]
+        )
+
+    def forward(self, g: Data):
+        g = self._encode(g)
+        for processor in self._processor:
+            g = processor(g)
+        return self._decoder(g.x)

@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
-from nets import EncodeProcessDecode
+from nets import EncodeProcessDecode, MeshGraphNet
 from normalizer import LogNormalizer, Normalizer
 from utils import get_weight
 
@@ -334,7 +334,7 @@ def main():
         shuffle=True,
     )
 
-    model = EncodeProcessDecode(
+    model = MeshGraphNet(
         node_dim=params["node_dim"],
         edge_dim=params["edge_dim"],
         output_dim=params["output_dim"],
