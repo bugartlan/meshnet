@@ -19,9 +19,9 @@ python data.py meshes/factory/msh/HexNut2_cg1.msh --num_samples 100
 
 Train:
 ```bash
-python train.py --dataset Cuboid200 --num-epochs 50 --learning-rate 1e-4 --batch-size 64 --tensorboard --layers 10
+python train.py --dataset Cuboid200 --epochs 50 --learning-rate 1e-4 --batch-size 64 --tensorboard --layers 10
 python train.py --dataset Cuboid \
- --num-epochs 500 \
+ --epochs 500 \
  --learning-rate 1e-4 \
  --batch-size 64 \
  --tensorboard \

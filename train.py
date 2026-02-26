@@ -28,7 +28,7 @@ def parse_args():
         help="Directory to save the trained model file.",
     )
     p.add_argument(
-        "--model-name",
+        "--output-name",
         type=str,
         default=None,
         help="Filename for the trained model file.",
@@ -36,8 +36,8 @@ def parse_args():
     p.add_argument(
         "--dataset",
         type=str,
-        default="cantilever_1_10",
-        help="Name of the graph dataset file (without extension).",
+        default="Primitives100",
+        help="Name of the graph dataset file (without extension) or folder.",
     )
 
     # --- Training Configuration ---
@@ -60,12 +60,12 @@ def parse_args():
     p.add_argument(
         "--alpha",
         type=float,
-        default=0.1,
+        default=100.0,
         help="Exponential scaling factor (only used if --weight-mode='weighted').",
     )
 
     # --- Training Hyperparameters ---
-    p.add_argument("--num-epochs", type=int, default=100)
+    p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--learning-rate", type=float, default=1e-5)
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
@@ -82,11 +82,6 @@ def parse_args():
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to run the model on (e.g., 'cpu' or 'cuda').",
-    )
-    p.add_argument(
-        "--plots",
-        action="store_true",
-        help="Whether to show the training loss plot.",
     )
     p.add_argument(
         "--tensorboard",
@@ -120,8 +115,8 @@ def set_seed(seed: int) -> None:
 
 
 def resolve_model_name(args: argparse.Namespace) -> str:
-    if args.model_name:
-        return args.model_name
+    if args.output_name:
+        return args.output_name
     return f"{args.dataset}_{args.target}_{'w' if args.weighted_loss else 'uw'}"
 
 
@@ -219,7 +214,9 @@ def train_model(
     loss_history = []
     use_amp = device.type == "cuda"
 
-    for epoch in tqdm(range(num_epochs), dynamic_ncols=True):
+    progress_bar = tqdm(range(num_epochs), dynamic_ncols=True)
+
+    for epoch in progress_bar:
         total_loss = 0.0
         total_nodes = 0
 
@@ -254,8 +251,10 @@ def train_model(
             writer.add_scalar("Loss/train", avg_loss, epoch)
             writer.add_scalar("Learning_Rate", scheduler.get_last_lr()[0], epoch)
 
-        if (epoch + 1) % 50 == 0:
-            tqdm.write(f"Epoch {epoch + 1}/{num_epochs}, Loss: {avg_loss:.6f}")
+        if (epoch + 1) % 10 == 0:
+            progress_bar.set_description(
+                f"Epoch {epoch + 1:>6}/{num_epochs}, Loss: {avg_loss:>.6f}"
+            )
 
     return loss_history
 
@@ -269,6 +268,7 @@ def save_checkpoint(
 ):
     torch.save(
         {
+            "model_name": model.__class__.__name__,
             "model_state_dict": model.state_dict(),
             "params": {
                 "node_dim": params["node_dim"],
@@ -282,7 +282,7 @@ def save_checkpoint(
             "normalizer": normalizer.__class__.__name__,
             "stats": normalizer.stats,
             "training_args": {
-                "num_epochs": args.num_epochs,
+                "num_epochs": args.epochs,
                 "learning_rate": args.learning_rate,
                 "batch_size": args.batch_size,
                 "seed": args.seed,
@@ -334,7 +334,7 @@ def main():
         shuffle=True,
     )
 
-    model = MeshGraphNet(
+    model = EncodeProcessDecode(
         node_dim=params["node_dim"],
         edge_dim=params["edge_dim"],
         output_dim=params["output_dim"],
@@ -355,7 +355,7 @@ def main():
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=use_amp)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.998)
-    loss_history = train_model(
+    train_model(
         model=model,
         loader=loader,
         optimizer=optimizer,
@@ -363,7 +363,7 @@ def main():
         scaler=scaler,
         target_indices=target_indices,
         device=device,
-        num_epochs=args.num_epochs,
+        num_epochs=args.epochs,
         writer=writer,
     )
 
@@ -377,13 +377,6 @@ def main():
     if writer is not None:
         writer.close()
         print(f"TensorBoard logs saved to: {log_path}")
-
-    if args.plots:
-        plt.plot(loss_history)
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.title("Training Loss")
-        plt.show()
 
 
 if __name__ == "__main__":
