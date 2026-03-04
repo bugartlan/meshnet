@@ -8,7 +8,11 @@ import torch
 import trimesh
 from tqdm import tqdm
 
-from graph_builder import GraphBuilderAugment, GraphBuilderBase, GraphBuilderVirtual
+from graph_builder import (
+    GraphBuilderAugment,
+    GraphBuilderBase,
+    GraphBuilderVirtual,
+)
 from simulator import Simulator
 from utils import info, msh_to_trimesh
 
@@ -21,7 +25,6 @@ class DataGenerator:
         num_contacts: int = 1,
         force_max: float = 1.0,
         sigma: float = 0.001,
-        contact_radius: float = 0.01,
         seed: int = 42,
         debug: bool = False,
     ):
@@ -31,7 +34,7 @@ class DataGenerator:
             num_samples (int): Number of samples to generate per mesh.
             num_contacts (int): Number of contact points per sample.
             force_max (float): Maximum magnitude of contact forces.
-            contact_radius (float): Radius around contact points for applying forces.
+            sigma (float): Standard deviation for Gaussian kernel in contact force application.
             seed (int): Random seed for reproducibility.
             debug (bool): If True, run in debug mode with verbose output.
         """
@@ -41,7 +44,6 @@ class DataGenerator:
         self.num_samples = num_samples
         self.num_contacts = num_contacts
         self.force_max = force_max
-        self.contact_radius = contact_radius
         self.sigma = sigma
         self.seed = seed
         self.debug = debug
@@ -105,9 +107,7 @@ class DataGenerator:
         forces: np.ndarray,
         queries: np.ndarray,
     ):
-        simulator = Simulator(
-            str(msh_path), contact_radius=self.contact_radius, std=self.sigma
-        )
+        simulator = Simulator(str(msh_path), std=self.sigma)
 
         results = []
         for p, f in tqdm(zip(points, forces)):
@@ -144,12 +144,6 @@ def parse_args():
         help="Number of contact points per sample.",
     )
     parser.add_argument(
-        "--force_max",
-        type=float,
-        default=1.0,
-        help="Maximum magnitude of contact forces.",
-    )
-    parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility."
     )
     parser.add_argument(
@@ -165,8 +159,8 @@ def main():
         out_dir=args.out_dir,
         num_samples=args.num_samples,
         num_contacts=args.num_contacts,
-        force_max=args.force_max,
-        contact_radius=0.01,
+        force_max=1.0,
+        sigma=0.01,
         seed=args.seed,
         debug=args.debug,
     )

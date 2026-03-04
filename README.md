@@ -7,8 +7,8 @@ pip install -r requirements.txt
 
 Generate volume meshes:
 ```bash
-python meshgen.py step --input meshes/Custom/step --output meshes/Custom/msh --size 0.005  --element-order 1
-python meshgen.py step --input meshes/Custom/step --output meshes/Custom/msh --size 0.0025  --element-order 2
+python meshgen.py step --input meshes/primitives/step --output meshes/primitives/msh --size 0.005  --element-order 1
+python meshgen.py step --input meshes/primitives/step --output meshes/primitives/msh --size 0.0025  --element-order 2
 ```
 
 Generate datasets:

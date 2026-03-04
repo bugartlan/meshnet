@@ -13,10 +13,7 @@ from utils import msh_to_trimesh
 
 
 class Simulator:
-    def __init__(
-        self, filename_msh: str, contact_radius: float = 0.01, std: float = 0.001
-    ):
-        self.contact_radius = contact_radius
+    def __init__(self, filename_msh: str, std: float = 0.001):
         self.std = std
 
         # Load mesh from .msh file
