@@ -1,8 +1,7 @@
 import numpy as np
 import trimesh
-from scipy.spatial.transform import Rotation as R
-
 from grasp import Contact, Grasp, Pose
+from scipy.spatial.transform import Rotation as R
 
 
 class GraspSampler:
@@ -133,7 +132,7 @@ class GraspSampler:
     def visualize_grasp(self, grasp, eps=1e-3, viewer="gl"):
         scene = trimesh.Scene()
         ax = trimesh.creation.axis(
-            origin_size=0.005, axis_radius=0.005, axis_length=0.1
+            origin_size=0.0025, axis_radius=0.0025, axis_length=0.1
         )
         scene.add_geometry(ax)
         scene.add_geometry(self.mesh)
@@ -144,11 +143,28 @@ class GraspSampler:
         right_offset = trimesh.transformations.translation_matrix([0, 0, half])
 
         tf = grasp.pose.se3()
+        self.gripper.box_finger_left.mesh.visual.face_colors = [64, 255, 128, 128]
+        self.gripper.box_finger_right.mesh.visual.face_colors = [64, 255, 128, 128]
         scene.add_geometry(
             self.gripper.box_finger_left.mesh, transform=tf @ left_offset
         )
         scene.add_geometry(
             self.gripper.box_finger_right.mesh, transform=tf @ right_offset
+        )
+
+        # Visualize contact points
+        c1_sphere = trimesh.creation.uv_sphere(radius=0.0025)
+        c1_sphere.visual.face_colors = [255, 0, 0, 255]
+        scene.add_geometry(
+            c1_sphere,
+            transform=trimesh.transformations.translation_matrix(grasp.c1.pos),
+        )
+
+        c2_sphere = trimesh.creation.uv_sphere(radius=0.0025)
+        c2_sphere.visual.face_colors = [255, 0, 0, 255]
+        scene.add_geometry(
+            c2_sphere,
+            transform=trimesh.transformations.translation_matrix(grasp.c2.pos),
         )
 
         scene.show(viewer=viewer)
