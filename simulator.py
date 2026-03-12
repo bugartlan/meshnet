@@ -1,6 +1,7 @@
 import meshio
 import numpy as np
 import pyvista
+import scipy
 import trimesh
 import ufl
 from dolfinx import default_scalar_type, fem, geometry, mesh, plot
@@ -246,16 +247,12 @@ class Simulator:
         # Final fallback: interpolate from nodal values (guarantees no missing labels).
         missing_idx = np.where(~found)[0]
         if len(missing_idx) > 0:
-            topology, cell_types, geom = plot.vtk_mesh(func.function_space)
-            grid = pyvista.UnstructuredGrid(topology, cell_types, geom)
-            grid.point_data["values"] = func.x.array.real.reshape(-1, bs)
-
-            cloud = pyvista.PolyData(points[missing_idx])
-            radius = 2.0 * np.linalg.norm(
-                self.domain.geometry.x.max(axis=0) - self.domain.geometry.x.min(axis=0)
-            )
-            sampled = cloud.interpolate(grid, radius=radius, sharpness=1.0)
-            values[missing_idx] = sampled.point_data["values"].reshape(-1, bs)
+            dof_coords = func.function_space.tabulate_dof_coordinates()
+            nodal_values = func.x.array.real.reshape(-1, bs)
+            tree = scipy.spatial.KDTree(dof_coords)
+            missing_points = points[missing_idx]
+            distances, nearest_dof_indices = tree.query(missing_points, k=1)
+            values[missing_idx] = nodal_values[nearest_dof_indices]
 
         return values.clip(min=0.0)  # Ensure non-negative values
 
