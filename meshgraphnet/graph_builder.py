@@ -291,9 +291,9 @@ class GraphBuilderVirtual(GraphBuilderBase):
     def _make_virtual_nodes(
         self, loads: list[tuple[np.ndarray, np.ndarray]]
     ) -> torch.Tensor:
-        # Virtual Nodes for Contacts
-        ps = torch.tensor([p for p, _ in loads], dtype=torch.float32)  # (n_v, 3)
-        fs = torch.tensor([f for _, f in loads], dtype=torch.float32)  # (n_v, 3)
+        # Virtual nodes for contacts; # (n_v, 3)
+        ps = torch.tensor(np.stack([p for p, _ in loads]), dtype=torch.float32)
+        fs = torch.tensor(np.stack([f for _, f in loads]), dtype=torch.float32)
         is_boundary = (
             torch.isclose(ps[:, 2], torch.zeros(len(loads)), atol=self.boundary_tol)
             .float()

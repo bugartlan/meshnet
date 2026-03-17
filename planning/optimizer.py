@@ -2,9 +2,9 @@ from abc import ABC
 
 import numpy as np
 import torch
+from grasp import Contact, Grasp
 from sampler import GraspSampler
 
-from grasp import Grasp
 from meshgraphnet.graph_builder import GraphBuilderVirtual
 from meshgraphnet.utils import msh_to_trimesh
 
@@ -77,6 +77,18 @@ def sample_wrenches(
     return w
 
 
+def sample_contact_forces(contact: Contact, fmin: float, fmax: float) -> np.ndarray:
+    """Sample a random contact force vector within the friction cone."""
+    # Sample a random direction in the tangent plane
+    tangent = np.random.randn(3)
+    tangent -= tangent.dot(contact.normal) * contact.normal  # project to tangent plane
+    tangent /= np.linalg.norm(tangent) + 1e-8  # normalize
+
+    # Sample a random magnitude within the friction cone
+    alpha = np.random.rand() * (fmax - fmin) + fmin  # scale to desired range
+    return alpha * tangent + contact.normal  # total contact force vector
+
+
 class GraspOptimizer(ABC):
     def __init__(self, gripper):
         self.gripper = gripper
@@ -100,6 +112,15 @@ class GNNBasedGraspOptimizer(GraspOptimizer):
         self.epsilon = 1e-4  # small tolerance for bottom stress extraction
 
     def optimize(self, msh, mu, k=20):
+        """Sample grasps, build graphs, and predict scores to find the best grasp.
+
+        Args:
+            msh: Trimesh mesh of the object to grasp.
+            mu: Friction coefficient for grasp sampling.
+            k: Number of wrenches to sample per grasp.
+        Returns:
+            best_grasp: Grasp with the highest predicted score, or None if no valid grasps found.
+        """
         mesh = msh_to_trimesh(msh)
         pos_com = mesh.center_mass
         num_nodes = msh.points.shape[0]

@@ -21,7 +21,7 @@ class Pose:
 @dataclass(frozen=True)
 class Contact:
     pos: np.ndarray
-    normal: np.ndarray
+    normal: np.ndarray  # unit vector pointing outwards from the surface
     mu: float
 
 
