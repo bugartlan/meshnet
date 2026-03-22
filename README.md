@@ -30,6 +30,8 @@ Generate volume meshes with two different resolutions:
 ```bash
 python meshgen.py step --input meshes/primitives/step --output meshes/primitives/msh --size 0.005  --element-order 1
 python meshgen.py step --input meshes/primitives/step --output meshes/primitives/msh --size 0.0025  --element-order 2
+python meshgen.py step --input meshes/factory/step --output meshes/factory/msh-1 --size 0.004  --element-order 1
+python meshgen.py step --input meshes/factory/step --output meshes/factory/msh-1 --size 0.0025  --element-order 2
 ```
 
 Generate datasets:

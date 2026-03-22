@@ -10,16 +10,23 @@ import torch.nn.functional as F
 from graph_builder import GraphVisualizer
 from nets import EncodeProcessDecode, MeshGraphNet
 from normalizer import LogNormalizer, Normalizer
-from utils import (
-    get_weight,
-    msh_to_trimesh,
-    strain_stress_vm,
-)
+from utils import get_weight, msh_to_trimesh
 
-################################ Material Properties ###################################
-E = 2.0e9  # Young's modulus
-nu = 0.35  # Poisson's ratio
-#########################################################################################
+
+def prepare_graphs(graphs, normalizer):
+    normalized_graphs = []
+
+    for graph in graphs:
+        graph_norm = normalizer.normalize(graph)
+        weight = get_weight(graph.x[:, 2], 1, mode="bottom")
+
+        # Only weight physical nodes, not virtual nodes
+        weight = weight * (graph.x[:, -1] != 1.0).unsqueeze(1).float()
+        graph_norm.weight = weight
+        graph_norm.y = graph.y
+        normalized_graphs.append(graph_norm)
+
+    return normalized_graphs
 
 
 def parse_args():
@@ -41,11 +48,6 @@ def parse_args():
 
     # --- Evaluation Configuration ---
     p.add_argument("--mode", choices=["all", "weighted", "bottom"], default="all")
-    p.add_argument(
-        "--compute_stress",
-        action="store_true",
-        help="If set, compute von Mises stress from the predicted displacement.",
-    )
     p.add_argument(
         "--target",
         choices=["all", "displacement", "stress"],
@@ -135,6 +137,9 @@ def main():
             stats=checkpoint["stats"],
         )
 
+    # Pre-normalize graphs
+    normalized_graphs = prepare_graphs(graphs, normalizer)
+
     model = EncodeProcessDecode(
         node_dim=params["node_dim"],
         edge_dim=params["edge_dim"],
@@ -162,35 +167,21 @@ def main():
     graphs_pred = []
     with torch.no_grad():
         start = time.time()
-        for g in graphs:
-            normalized_g = normalizer.normalize(g)
-
-            y_pred = model(normalized_g)
+        for g in normalized_graphs:
+            y_pred = model(g)
             y_pred = normalizer.denormalize_y(y_pred)
 
             g_pred = g.clone()
             g_pred.y = y_pred
-
-            if args.compute_stress:
-                eps, sigma, vm = strain_stress_vm(g_pred, E, nu)
-                g_pred.y[:, 3] = vm
 
             graphs_pred.append(g_pred)
 
             y_true = g.y[:, target_indices]
             y_pred = g_pred.y[:, target_indices]
 
-            weight = get_weight(
-                g.x[:, 2],
-                y_true.shape[1],
-                mode=args.mode,
-                alpha=args.alpha,
-            )
-            weight *= (g.x[:, -1] != 1.0).unsqueeze(1).float()
+            loss = F.l1_loss(y_pred, y_true, weight=g.weight)
 
-            loss = F.l1_loss(y_pred, y_true, weight=weight)
-
-            num_nodes = weight.sum().item()
+            num_nodes = g.weight.sum().item()
             total_loss += loss.item() * num_nodes
             total_nodes += num_nodes
         end = time.time()
@@ -247,7 +238,7 @@ def main():
                 visualizer.stress(g_true, save_path=filename_true)
                 visualizer.stress(g_pred, save_path=filename_pred)
 
-            print(f"Saved plots for sample {i} ({msh_path.stem}).")
+            print(f"Saved plots for sample {idx[i]} ({msh_path.stem}).")
 
 
 if __name__ == "__main__":

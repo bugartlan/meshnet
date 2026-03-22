@@ -245,9 +245,7 @@ class GraphBuilderVirtual(GraphBuilderBase):
         # Edges
         edge_index, edge_attr = self._make_edges(mesh)
         if contacts:
-            v_idx, v_attr = self._make_virtual_edges(
-                mesh.points.shape[0], len(contacts)
-            )
+            v_idx, v_attr = self._make_virtual_edges(mesh, contacts)
             edge_index = torch.hstack([edge_index, v_idx])
             edge_attr = torch.vstack([edge_attr, v_attr])
 
@@ -300,25 +298,30 @@ class GraphBuilderVirtual(GraphBuilderBase):
         virtual_flag = torch.ones(len(loads), 1)
         return torch.cat([ps, fs, is_boundary, virtual_flag], dim=1)
 
-    def _make_virtual_edges(self, n_phys: int, n_virtual: int) -> torch.Tensor:
+    def _make_virtual_edges(
+        self, mesh: meshio.Mesh, contacts: list[tuple[np.ndarray, np.ndarray]]
+    ) -> torch.Tensor:
         # Create virtual edges from virtual nodes to their corresponding physical nodes
+        n_phys = mesh.points.shape[0]
+        n_virtual = len(contacts)
         p = torch.arange(n_phys, dtype=torch.long)
         v = torch.arange(n_phys, n_phys + n_virtual, dtype=torch.long)
 
-        # Each virtual node connects to every physical node
-        v_rep = v.repeat_interleave(n_phys)  # (n_virtual * n_phys,)
-        p_tiled = p.repeat(n_virtual)  # (n_virtual * n_phys,)
+        # Each virtual node connects to every physical node: (n_virtual * n_phys,)
+        v_rep = v.repeat_interleave(n_phys)
+        p_tiled = p.repeat(n_virtual)
 
-        edge_index = torch.cat(
-            [
-                torch.stack([v_rep, p_tiled], dim=0),
-                torch.stack([p_tiled, v_rep], dim=0),
-            ],
-            dim=1,
-        )  # (2, 2*n_v*n_p)
-        edge_attr = torch.zeros(
-            (edge_index.shape[1], 4), dtype=torch.float32
-        )  # No attributes for virtual edges
+        edge_index = torch.stack([v_rep, p_tiled], dim=0)  # (2, n_virtual * n_phys)
+
+        # Match base edge features: [dx, dy, dz, distance] for directed edges.
+        phys_coords = torch.as_tensor(mesh.points, dtype=torch.float32)
+        virt_coords = torch.tensor([p for p, _ in contacts], dtype=torch.float32)
+        all_coords = torch.vstack([phys_coords, virt_coords])
+
+        src, dst = edge_index
+        disp = all_coords[dst] - all_coords[src]
+        dist = torch.norm(disp, dim=1, keepdim=True)
+        edge_attr = torch.hstack([disp, dist])
 
         return edge_index, edge_attr
 
