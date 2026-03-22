@@ -66,7 +66,6 @@ class DataGenerator:
         mesh_cg2 = meshio.read(msh_path_cg2)
 
         points, forces = self._sample(mesh_cg2)
-        # results = self._simulate(msh_path_cg1, points, forces, mesh_cg1.points)
         results = self._simulate(msh_path_cg2, points, forces, mesh_cg1.points)
 
         graphs = []

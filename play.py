@@ -1,4 +1,5 @@
 import argparse
+import time
 from pathlib import Path
 
 import meshio
@@ -100,6 +101,11 @@ def main():
 
     data = torch.load(f"data/{args.dataset}.pt", weights_only=False)
     graphs = [g.to(device) for g in data["graphs"]]
+    print(f"Loaded dataset '{args.dataset}' with {len(graphs)} graphs.")
+    print(
+        f"Each graph has {graphs[0].num_nodes} nodes and {graphs[0].num_edges} edges."
+    )
+
     msh_path = data["mesh"]
 
     checkpoint = torch.load(
@@ -109,6 +115,10 @@ def main():
     )
     model_state_dict = checkpoint["model_state_dict"]
     params = checkpoint["params"]
+    print(f"Loaded model checkpoint '{args.checkpoint}' with parameters:")
+    print(f"    Node dim: {params['node_dim']}")
+    print(f"    Edge dim: {params['edge_dim']}")
+    print(f"    Output dim: {params['output_dim']}")
 
     if checkpoint["normalizer"] == "LogNormalizer":
         normalizer = LogNormalizer(
@@ -151,6 +161,7 @@ def main():
 
     graphs_pred = []
     with torch.no_grad():
+        start = time.time()
         for g in graphs:
             normalized_g = normalizer.normalize(g)
 
@@ -175,11 +186,15 @@ def main():
                 mode=args.mode,
                 alpha=args.alpha,
             )
+            weight *= (g.x[:, -1] != 1.0).unsqueeze(1).float()
 
             loss = F.l1_loss(y_pred, y_true, weight=weight)
 
-            total_loss += loss.item() * g.num_nodes
-            total_nodes += g.num_nodes
+            num_nodes = weight.sum().item()
+            total_loss += loss.item() * num_nodes
+            total_nodes += num_nodes
+        end = time.time()
+        print(f"Inference completed in {end - start:.2f} seconds.")
 
     avg_loss = total_loss / total_nodes
     print(f"Average L1 Loss over dataset: {avg_loss:.6f}")
@@ -200,13 +215,34 @@ def main():
             g_true = graphs[idx[i]].cpu()
             g_pred = graphs_pred[idx[i]].cpu()
 
+            n_phys = g_true.num_physical_nodes
+
+            # Create error graph for von Mises stress visualization
+            g_err_vm = g_true.clone()
+            g_err_vm.y = g_true.y.clone()
+            g_err_vm.y[:n_phys, 3] = (g_pred.y[:n_phys, 3] - g_true.y[:n_phys, 3]).abs()
+
             filename_true = args.plot_dir / f"{msh_path.stem}_smpl{i}_true{suffix}.html"
             filename_pred = args.plot_dir / f"{msh_path.stem}_smpl{i}_pred{suffix}.html"
+            filename_err = args.plot_dir / f"{msh_path.stem}_smpl{i}_error{suffix}.html"
 
             # Visualize ground truth and prediction
             if args.mode == "bottom":
-                visualizer.bottom(g_true, save_path=filename_true)
-                visualizer.bottom(g_pred, save_path=filename_pred)
+                bottom_mask = torch.isclose(
+                    g_true.x[:n_phys, 2],
+                    torch.zeros_like(g_true.x[:n_phys, 2]),
+                    atol=1e-6,
+                )
+                true_bottom = g_true.y[:n_phys, 3][bottom_mask]
+                pred_bottom = g_pred.y[:n_phys, 3][bottom_mask]
+                clim = (
+                    torch.min(torch.cat([true_bottom, pred_bottom])).item(),
+                    torch.max(torch.cat([true_bottom, pred_bottom])).item(),
+                )
+                visualizer.bottom(g_true, clim=clim, save_path=filename_true)
+                visualizer.bottom(g_pred, clim=clim, save_path=filename_pred)
+                visualizer.bottom(g_err_vm, clim=clim, save_path=filename_err)
+
             else:
                 visualizer.stress(g_true, save_path=filename_true)
                 visualizer.stress(g_pred, save_path=filename_pred)

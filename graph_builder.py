@@ -54,44 +54,40 @@ class GraphBuilderBase:
             contacts=contacts,
         )
 
-    def gaussian_loads(self, coords: np.ndarray, contacts: list[tuple]) -> float:
-        num_nodes = coords.shape[0]
-        nodal_forces = np.zeros((num_nodes, 3), dtype=np.float32)
-
+    def gaussian_loads(self, coords: np.ndarray, contacts: list[tuple]) -> torch.Tensor:
+        n = coords.shape[0]
         if not contacts:
-            return nodal_forces
+            return torch.zeros((n, 3), dtype=torch.float32)
 
-        for point, force in contacts:
-            point = np.asarray(point)  # (3,)
-            force = np.asarray(force)  # (3, )
+        pts = np.asarray([p for p, _ in contacts])  # (k, 3)
+        frc = np.asarray([f for _, f in contacts])  # (k, 3)
 
-            dist_sq = np.sum((coords - point) ** 2, axis=1)
-            weights = np.exp(-dist_sq / (2 * self.std**2))
-            weights_sum = np.sum(weights)
-            if weights_sum > 0:
-                weights /= weights_sum
+        d = coords[:, None, :] - pts[None, :, :]
+        dist_sq = np.einsum("nkd,nkd->nk", d, d)
+        w = np.exp(-dist_sq / (2 * self.std**2))
+        w_sum = w.sum(axis=0, keepdims=True)
+        w /= np.where(w_sum > 0, w_sum, 1.0)
 
-            nodal_forces += weights[:, None] * force
-
-        return torch.tensor(nodal_forces, dtype=torch.float32)
+        return torch.from_numpy((w @ frc).astype(np.float32, copy=False))
 
     def _make_nodes(
         self,
         mesh: meshio.Mesh,
         loads: list[tuple[np.ndarray, np.ndarray]],
     ) -> torch.Tensor:
-        vertices = mesh.points
-        num_nodes = vertices.shape[0]
+        vertices = mesh.points.astype(np.float32, copy=False)
 
         # Position Coordinates
-        coords = torch.tensor(vertices, dtype=torch.float32)
+        coords = torch.from_numpy(vertices)
 
         # Force Vectors
         forces = self.gaussian_loads(vertices, loads)
 
         # Boundary Mask
-        mask = torch.zeros((num_nodes, 1), dtype=torch.float32)
-        mask[np.isclose(vertices[:, 2], 0.0, atol=self.boundary_tol)] = 1
+        mask_np = np.isclose(vertices[:, 2], 0.0, atol=self.boundary_tol).astype(
+            np.float32
+        )[:, None]
+        mask = torch.from_numpy(mask_np)
 
         return torch.hstack([coords, forces, mask])
 
@@ -126,10 +122,9 @@ class GraphBuilderBase:
                         ]
                     )
                 )
-            if not edge_sets:
-                raise ValueError(
-                    "No supported cell types (tetra, triangle) found in mesh."
-                )
+        if not edge_sets:
+            raise ValueError("No supported cell types (tetra, triangle) found in mesh.")
+
         edges = np.vstack(edge_sets)
         edges.sort(axis=1)
         unique_edges = np.unique(edges, axis=0)
@@ -138,15 +133,12 @@ class GraphBuilderBase:
         disp = v[dst] - v[src]  # shape (E, 3)
         dist = np.linalg.norm(disp, axis=1, keepdims=True)  # shape (E, 1)
 
-        # Indices
-        edge_index_fwd = np.stack([src, dst], axis=0)
-        edge_index_bwd = np.stack([dst, src], axis=0)
-        edge_index = np.hstack([edge_index_fwd, edge_index_bwd])  # shape (2, 2E)
-
-        # Attributes
-        attr_fwd = np.hstack([disp, dist])  # shape (E, 4)
-        attr_bwd = np.hstack([-disp, dist])  # shape (E, 4)
-        edge_attr = np.vstack([attr_fwd, attr_bwd])  # shape (2E, 4)
+        edge_index = np.hstack(
+            [np.stack([src, dst], axis=0), np.stack([dst, src], axis=0)]
+        )  # shape (2, 2E)
+        edge_attr = np.vstack(
+            [np.hstack([disp, dist]), np.hstack([-disp, dist])]
+        )  # shape (2E, 4)
 
         return (
             torch.tensor(edge_index, dtype=torch.long),
@@ -235,6 +227,8 @@ class GraphBuilderVirtual(GraphBuilderBase):
         y: np.ndarray,
         contacts: list[tuple] | None = None,
     ) -> Data:
+        contacts = contacts or []
+
         if y.shape[0] != mesh.points.shape[0]:
             raise ValueError(
                 f"Output array y must have shape [num_nodes, num_output_features], but got {y.shape} and {mesh.points.shape[0]} nodes."
@@ -244,14 +238,18 @@ class GraphBuilderVirtual(GraphBuilderBase):
         x = self._make_nodes(mesh, contacts)
 
         # Pad for virtual nodes
-        y = np.vstack([y, np.zeros((len(contacts), y.shape[1]), dtype=np.float32)])
+        if contacts:
+            y = np.vstack([y, np.zeros((len(contacts), y.shape[1]), dtype=np.float32)])
         y = torch.tensor(y, dtype=torch.float32)
 
         # Edges
         edge_index, edge_attr = self._make_edges(mesh)
-        virtual_edge_index, virtual_edge_attr = self._make_virtual_edges(x)
-        edge_index = torch.hstack([edge_index, virtual_edge_index])
-        edge_attr = torch.vstack([edge_attr, virtual_edge_attr])
+        if contacts:
+            v_idx, v_attr = self._make_virtual_edges(
+                mesh.points.shape[0], len(contacts)
+            )
+            edge_index = torch.hstack([edge_index, v_idx])
+            edge_attr = torch.vstack([edge_attr, v_attr])
 
         num_physical_nodes = mesh.points.shape[0]
 
@@ -302,25 +300,27 @@ class GraphBuilderVirtual(GraphBuilderBase):
         virtual_flag = torch.ones(len(loads), 1)
         return torch.cat([ps, fs, is_boundary, virtual_flag], dim=1)
 
-    def _make_virtual_edges(self, nodes: torch.Tensor) -> torch.Tensor:
+    def _make_virtual_edges(self, n_phys: int, n_virtual: int) -> torch.Tensor:
         # Create virtual edges from virtual nodes to their corresponding physical nodes
-        virtual_node_indices = torch.where(nodes[:, -1] == 1)[0]
-        physical_node_indices = torch.where(nodes[:, -1] == 0)[0]
-
-        n_v = len(virtual_node_indices)
-        n_p = len(physical_node_indices)
+        p = torch.arange(n_phys, dtype=torch.long)
+        v = torch.arange(n_phys, n_phys + n_virtual, dtype=torch.long)
 
         # Each virtual node connects to every physical node
-        v_repeated = virtual_node_indices.repeat_interleave(n_p)  # (n_v * n_p,)
-        p_tiled = physical_node_indices.repeat(n_v)  # (n_v * n_p,)
+        v_rep = v.repeat_interleave(n_phys)  # (n_virtual * n_phys,)
+        p_tiled = p.repeat(n_virtual)  # (n_virtual * n_phys,)
 
-        edge_index_fwd = torch.stack([v_repeated, p_tiled], dim=0)
-        edge_index_bwd = torch.stack([p_tiled, v_repeated], dim=0)
         edge_index = torch.cat(
-            [edge_index_fwd, edge_index_bwd], dim=1
+            [
+                torch.stack([v_rep, p_tiled], dim=0),
+                torch.stack([p_tiled, v_rep], dim=0),
+            ],
+            dim=1,
         )  # (2, 2*n_v*n_p)
+        edge_attr = torch.zeros(
+            (edge_index.shape[1], 4), dtype=torch.float32
+        )  # No attributes for virtual edges
 
-        return edge_index, torch.zeros((edge_index.shape[1], 4), dtype=torch.float32)
+        return edge_index, edge_attr
 
 
 class GraphVisualizer:
