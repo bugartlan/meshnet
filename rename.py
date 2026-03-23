@@ -22,4 +22,4 @@ def copy_with_suffix(src_dir: str, dst_dir: str, suffix: str = "-2"):
 
 
 if __name__ == "__main__":
-    copy_with_suffix("data/Primitives500-2/", "data/Train/", suffix="-2")
+    copy_with_suffix("data/Factory1000-2-1/", "data/Train/", suffix="-4")

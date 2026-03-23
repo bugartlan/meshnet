@@ -6,6 +6,7 @@ import meshio
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.stats import kendalltau
 
 from graph_builder import GraphVisualizer
 from nets import EncodeProcessDecode, MeshGraphNet
@@ -27,6 +28,48 @@ def prepare_graphs(graphs, normalizer):
         normalized_graphs.append(graph_norm)
 
     return normalized_graphs
+
+
+def plot(g1, g2, visualizer, mode, f1, f2, f3):
+    n_phys = g1.num_physical_nodes
+
+    # Create error graph for von Mises stress visualization
+    g_err_vm = g1.clone()
+    g_err_vm.y = g1.y.clone()
+    g_err_vm.y[:n_phys, 3] = (g2.y[:n_phys, 3] - g1.y[:n_phys, 3]).abs()
+
+    # Visualize ground truth and prediction
+    if mode == "bottom":
+        bottom_mask = torch.isclose(
+            g1.x[:n_phys, 2],
+            torch.zeros_like(g1.x[:n_phys, 2]),
+            atol=1e-6,
+        )
+        true_bottom = g1.y[:n_phys, 3][bottom_mask]
+        pred_bottom = g2.y[:n_phys, 3][bottom_mask]
+        clim = (
+            torch.min(torch.cat([true_bottom, pred_bottom])).item(),
+            torch.max(torch.cat([true_bottom, pred_bottom])).item(),
+        )
+        visualizer.bottom(g1, clim=clim, save_path=f1)
+        visualizer.bottom(g2, clim=clim, save_path=f2)
+        visualizer.bottom(g_err_vm, clim=clim, save_path=f3)
+
+    else:
+        clim = (
+            torch.min(torch.cat([g1.y[:n_phys, 3], g2.y[:n_phys, 3]])).item(),
+            torch.max(torch.cat([g1.y[:n_phys, 3], g2.y[:n_phys, 3]])).item(),
+        )
+        visualizer.stress(g1, clim=clim, save_path=f1)
+        visualizer.stress(g2, clim=clim, save_path=f2)
+        visualizer.stress(g_err_vm, clim=clim, save_path=f3)
+
+
+def mae75(x: np.ndarray, y: np.ndarray, weight: np.ndarray = None) -> float:
+    x = x[weight > 0]
+    y = y[weight > 0]
+    mask = y >= np.percentile(y, 75)
+    return np.abs(x - y)[mask].mean()
 
 
 def parse_args():
@@ -104,9 +147,10 @@ def main():
     data = torch.load(f"data/{args.dataset}.pt", weights_only=False)
     graphs = [g.to(device) for g in data["graphs"]]
     print(f"Loaded dataset '{args.dataset}' with {len(graphs)} graphs.")
-    print(
-        f"Each graph has {graphs[0].num_nodes} nodes and {graphs[0].num_edges} edges."
-    )
+
+    num_nodes = graphs[0].num_nodes
+    num_edges = graphs[0].num_edges
+    print(f"Each graph has {num_nodes} nodes and {num_edges} edges.")
 
     msh_path = data["mesh"]
 
@@ -162,7 +206,8 @@ def main():
         raise ValueError(f"Unknown target: {args.target}")
 
     total_loss = 0.0
-    total_nodes = 0
+    total_loss75 = 0.0
+    total_kendall = 0.0
 
     graphs_pred = []
     with torch.no_grad():
@@ -174,71 +219,100 @@ def main():
             g_pred = g.clone()
             g_pred.y = y_pred
 
-            graphs_pred.append(g_pred)
-
             y_true = g.y[:, target_indices]
             y_pred = g_pred.y[:, target_indices]
 
-            loss = F.l1_loss(y_pred, y_true, weight=g.weight)
+            loss = F.l1_loss(y_pred, y_true, weight=g.weight).item()
+            loss75 = mae75(
+                y_pred.cpu().numpy(),
+                y_true.cpu().numpy(),
+                weight=g.weight.cpu().numpy(),
+            )
+            tau = kendalltau(y_true.cpu().numpy(), y_pred.cpu().numpy()).statistic
+            total_loss += loss
+            total_loss75 += loss75
+            total_kendall += tau
 
-            num_nodes = g.weight.sum().item()
-            total_loss += loss.item() * num_nodes
-            total_nodes += num_nodes
+            graphs_pred.append((g_pred.cpu(), tau, loss, loss75))
         end = time.time()
         print(f"Inference completed in {end - start:.2f} seconds.")
 
-    avg_loss = total_loss / total_nodes
-    print(f"Average L1 Loss over dataset: {avg_loss:.6f}")
+    print("Results:")
+    print(f"Average L1 Loss over dataset: {total_loss / len(graphs):.6f}")
+    print(f"Average L1 Loss (75th percentile): {total_loss75 / len(graphs):.6f}")
+    print(f"Average Kendall's Tau metric: {total_kendall / len(graphs):.4f}")
+    min_tau_idx, (min_tau_g, min_tau, min_tau_loss, min_tau_loss75) = min(
+        enumerate(graphs_pred), key=lambda x: x[1][1]
+    )
+    max_tau_idx, (max_tau_g, max_tau, max_tau_loss, max_tau_loss75) = max(
+        enumerate(graphs_pred), key=lambda x: x[1][1]
+    )
+    print(f"Min Tau: {min_tau:.4f}, Max Tau: {max_tau:.4f}")
 
     if args.plots:
-        print(f"Generating {args.n} plots in {args.plot_dir}...")
         rng = np.random.default_rng(42)
-
-        n_samples = min(args.n, len(graphs_pred))
-        idx = rng.choice(len(graphs_pred), size=n_samples, replace=False)
+        idx = rng.choice(
+            len(graphs_pred), size=min(args.n, len(graphs_pred)), replace=False
+        )
         visualizer = GraphVisualizer(
             msh_to_trimesh(meshio.read(msh_path)), jupyter_backend=False
         )
 
         suffix = "_bottom" if args.mode == "bottom" else ""
 
-        for i in range(n_samples):
-            g_true = graphs[idx[i]].cpu()
-            g_pred = graphs_pred[idx[i]].cpu()
+        plot(
+            graphs[min_tau_idx].cpu(),
+            min_tau_g,
+            visualizer,
+            args.mode,
+            args.plot_dir / f"{msh_path.stem}_min_tau_true{suffix}.html",
+            args.plot_dir / f"{msh_path.stem}_min_tau_pred{suffix}.html",
+            args.plot_dir / f"{msh_path.stem}_min_tau_error{suffix}.html",
+        )
+        print(
+            f"Saved plots for min Tau sample {min_tau_idx} ({msh_path.stem}): "
+            f"tau={min_tau:.4f}, loss={min_tau_loss:.6f}, "
+            f"loss (75%)={min_tau_loss75:.6f}."
+        )
+        plot(
+            graphs[max_tau_idx].cpu(),
+            max_tau_g,
+            visualizer,
+            args.mode,
+            args.plot_dir / f"{msh_path.stem}_max_tau_true{suffix}.html",
+            args.plot_dir / f"{msh_path.stem}_max_tau_pred{suffix}.html",
+            args.plot_dir / f"{msh_path.stem}_max_tau_error{suffix}.html",
+        )
+        print(
+            f"Saved plots for max Tau sample {max_tau_idx} ({msh_path.stem}): "
+            f"tau={max_tau:.4f}, loss={max_tau_loss:.6f}, "
+            f"loss (75%)={max_tau_loss75:.6f}."
+        )
 
-            n_phys = g_true.num_physical_nodes
-
-            # Create error graph for von Mises stress visualization
-            g_err_vm = g_true.clone()
-            g_err_vm.y = g_true.y.clone()
-            g_err_vm.y[:n_phys, 3] = (g_pred.y[:n_phys, 3] - g_true.y[:n_phys, 3]).abs()
+        print(f"Generating {len(idx)} plots in {args.plot_dir}...")
+        for i in idx:
+            g_true = graphs[i].cpu()
+            g_pred, tau, loss, loss75 = graphs_pred[i]
 
             filename_true = args.plot_dir / f"{msh_path.stem}_smpl{i}_true{suffix}.html"
             filename_pred = args.plot_dir / f"{msh_path.stem}_smpl{i}_pred{suffix}.html"
             filename_err = args.plot_dir / f"{msh_path.stem}_smpl{i}_error{suffix}.html"
 
-            # Visualize ground truth and prediction
-            if args.mode == "bottom":
-                bottom_mask = torch.isclose(
-                    g_true.x[:n_phys, 2],
-                    torch.zeros_like(g_true.x[:n_phys, 2]),
-                    atol=1e-6,
-                )
-                true_bottom = g_true.y[:n_phys, 3][bottom_mask]
-                pred_bottom = g_pred.y[:n_phys, 3][bottom_mask]
-                clim = (
-                    torch.min(torch.cat([true_bottom, pred_bottom])).item(),
-                    torch.max(torch.cat([true_bottom, pred_bottom])).item(),
-                )
-                visualizer.bottom(g_true, clim=clim, save_path=filename_true)
-                visualizer.bottom(g_pred, clim=clim, save_path=filename_pred)
-                visualizer.bottom(g_err_vm, clim=clim, save_path=filename_err)
+            plot(
+                g_true,
+                g_pred,
+                visualizer,
+                args.mode,
+                filename_true,
+                filename_pred,
+                filename_err,
+            )
 
-            else:
-                visualizer.stress(g_true, save_path=filename_true)
-                visualizer.stress(g_pred, save_path=filename_pred)
-
-            print(f"Saved plots for sample {idx[i]} ({msh_path.stem}).")
+            print(
+                f"Saved plots for sample {i} ({msh_path.stem}): "
+                f"tau={tau:.4f}, loss={loss:.6f}, "
+                f"loss (75%)={loss75:.6f}."
+            )
 
 
 if __name__ == "__main__":
