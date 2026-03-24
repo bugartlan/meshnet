@@ -12,7 +12,7 @@ from utils import get_weight
 
 labels = ["x-displacement", "y-displacement", "z-displacement", "Von Mises Stress"]
 
-DATA_FILE = "data/Test100-2/Bushing3_100.pt"
+DATA_FILE = "data/archive/Test100-2/T-Bracket3_100.pt"
 CHECKPOINT_FILE = "models/Mix250_all_w.pth"
 TARGET_INDEX = 3
 BATCH_SIZE = 16
@@ -89,7 +89,6 @@ def main():
         end = time.time()
 
     avg_loss = total_loss / total_nodes
-    print(total_loss, total_nodes)
     print(f"Inference completed in {end - start:.2f} seconds.")
     print(f"Average L1 Loss over dataset: {avg_loss:.6f}")
 

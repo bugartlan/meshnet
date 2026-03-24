@@ -209,6 +209,8 @@ def train_model(
     device,
     num_epochs: int,
     writer,
+    checkpoint_cfg: dict,
+    checkpoint_interval: int = 50,
 ):
     model.train()
     loss_history = []
@@ -250,6 +252,17 @@ def train_model(
         if writer is not None:
             writer.add_scalar("Loss/train", avg_loss, epoch)
             writer.add_scalar("Learning_Rate", scheduler.get_last_lr()[0], epoch)
+
+        if (epoch + 1) % checkpoint_interval == 0:
+            checkpoint_path = checkpoint_cfg["dir"] / f"model{epoch + 1}.pth"
+            save_checkpoint(
+                checkpoint_cfg["path"],
+                model,
+                checkpoint_cfg["params"],
+                checkpoint_cfg["normalizer"],
+                checkpoint_cfg["args"],
+            )
+            print(f"Saved checkpoint at epoch {epoch + 1}: {checkpoint_path}")
 
         if (epoch + 1) % 10 == 0:
             progress_bar.set_description(
@@ -350,6 +363,9 @@ def main():
             print(f"{name}: {param.dtype}, shape: {param.shape}")
 
     writer, log_path = create_tensorboard_writer(args, model_name)
+    checkpoint_dir = args.log_dir / model_name / time.strftime("%Y%m%d-%H%M%S")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Checkpoint directory: {checkpoint_dir}")
 
     start = time.time()
     use_amp = device.type == "cuda"
@@ -365,6 +381,14 @@ def main():
         device=device,
         num_epochs=args.epochs,
         writer=writer,
+        checkpoint_cfg={
+            "dir": checkpoint_dir,
+            "path": checkpoint_dir / f"{model_name}.pth",
+            "params": params,
+            "normalizer": normalizer,
+            "args": args,
+        },
+        checkpoint_interval=50,
     )
 
     checkpoint_path = args.output_dir / f"{model_name}.pth"
