@@ -37,11 +37,11 @@ class GraspSampler:
         return plane
 
     def sample(self, n_samples, debug=False):
-        grasps = self.sample_antipodal_points(n_samples)
+        grasps = self.sample_antipodal_points(n_samples, debug=debug)
         valid_grasps = []
         print(f"Sampled {len(grasps)} antipodal grasps, checking for collisions...")
         for grasp in grasps:
-            poses = self.sample_poses(grasp.c1, grasp.c2)
+            poses = self.sample_poses(grasp.c1, grasp.c2, k=12)
             for pose in poses:
                 if debug:
                     self.visualize_grasp(Grasp(pose, grasp.width, grasp.c1, grasp.c2))
@@ -52,42 +52,50 @@ class GraspSampler:
         print(f"{len(valid_grasps)} valid grasps found after collision checking.")
         return valid_grasps
 
-    def sample_antipodal_points(self, n_samples, eps=1e-3):
+    def sample_antipodal_points(self, n_samples, eps=1e-4, debug=False):
         # Sample points + face ids from the mesh
         pts, face_ids = self.mesh.sample(n_samples, return_index=True)
+        mask = pts[:, 2] > 0.01  # Filter out points that are too close to the floor
+        pts = pts[mask]
+        face_ids = face_ids[mask]
         n1 = self.mesh.face_normals[face_ids]
 
-        intersector = trimesh.ray.ray_pyembree.RayMeshIntersector(self.mesh)
+        directions = -n1  # rays shoot inward along negative normal
+        origins = pts + eps * directions
+
+        intersector = trimesh.ray.ray_triangle.RayMeshIntersector(self.mesh)
+        locs, index_ray, index_tri = intersector.intersects_location(
+            origins, directions, multiple_hits=True
+        )
 
         cos_theta = 1.0 / np.sqrt(1.0 + self.mu * self.mu)
-
         grasps = []
-        for p, n in zip(pts, n1):
-            d = -n  # direction shoots inward along negative normal
-            origins = (p + eps * d).reshape(1, 3)
-            directions = d.reshape(1, 3)
 
-            locations, index_ray, index_tri = intersector.intersects_location(
-                origins, directions, multiple_hits=False
+        for idx in np.unique(index_ray):
+            mask = index_ray == idx
+            qs = locs[mask][::2]  # Check every other hit
+            tris = index_tri[mask][::2]
+
+            p, n = pts[idx], n1[idx]
+            dists = np.linalg.norm(qs - p, axis=1)
+            ms = self.mesh.face_normals[tris]
+
+            disp = (qs - p) / dists[:, None]
+            inner_product = np.einsum("ij,ij->i", ms, disp)
+            valid = (
+                (dists >= self.gripper.min_width)
+                & (dists <= self.gripper.max_width)
+                & (inner_product >= cos_theta)
             )
-
-            if len(locations) == 0:
-                continue
-
-            q = locations[0]
-            width = np.linalg.norm(q - p)
-            if width < self.gripper.min_width or width > self.gripper.max_width:
-                continue
-
-            m = self.mesh.face_normals[face_ids[0]]
-            x = (q - p) / width
-            # Check if the angle between the normal and the approach vector is within the friction cone
-            if np.dot(m, -x) < cos_theta:
-                continue
-
-            c1 = Contact(pos=p, normal=n, mu=self.mu)
-            c2 = Contact(pos=q, normal=x, mu=self.mu)
-            grasps.append(Grasp(None, width, c1, c2))
+            for q, d, m in zip(qs[valid], dists[valid], ms[valid]):
+                grasps.append(
+                    Grasp(
+                        None,
+                        d,
+                        Contact(pos=p, normal=n, mu=self.mu),
+                        Contact(pos=q, normal=m, mu=self.mu),
+                    )
+                )
 
         return grasps
 
