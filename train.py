@@ -294,7 +294,10 @@ def prepare_graphs(
 
 
 def build_normalizer(
-    use_log_loss: bool, num_features: int, num_categorical: int
+    use_log_loss: bool,
+    num_features: int,
+    num_categorical: int,
+    device: str = "cpu",
 ) -> Normalizer:
     """Instantiate the appropriate normalizer based on the loss flag.
 
@@ -302,12 +305,15 @@ def build_normalizer(
         use_log_loss: If ``True``, return a ``LogNormalizer``.
         num_features: Total number of node feature dimensions.
         num_categorical: Number of categorical (non-normalised) features.
+        device: Compute device for normalizer statistics tensors.
 
     Returns:
         An unfitted ``Normalizer`` or ``LogNormalizer``.
     """
     cls = LogNormalizer if use_log_loss else Normalizer
-    return cls(num_features=num_features, num_categorical=num_categorical)
+    return cls(
+        num_features=num_features, num_categorical=num_categorical, device=device
+    )
 
 
 def build_model(config: ModelConfig, device: torch.device) -> EncodeProcessDecode:
@@ -550,23 +556,37 @@ def main():
     set_seed(args.seed)
 
     device = torch.device(args.device)
-
-    graphs, params, dataset_path = load_graphs_and_params(args.dataset)
     print(f"Using device: {device}")
-    print(f"Loaded {len(graphs)} graphs from: {dataset_path}")
+
+    start = time.time()
+    graphs, params, dataset_path = load_graphs_and_params(args.dataset)
+    print(
+        f"Loaded {len(graphs)} graphs from: {dataset_path} in {time.time() - start:.2f}s."
+    )
 
     # Normalizer
     normalizer = build_normalizer(
         args.log_loss, params["node_dim"], params["num_categorical"]
     )
     normalizer.fit(graphs)
+    print("Fitted normalizer to training data.")
 
     # Data
     target_indices = get_target_indices(args.target)
     normalized_graphs = prepare_graphs(
         graphs, normalizer, args.weighted_loss, args.alpha, len(target_indices)
     )
-    loader = DataLoader(normalized_graphs, batch_size=args.batch_size, shuffle=True)
+    print(f"Prepared {len(normalized_graphs)} normalised graphs for training.")
+
+    loader = DataLoader(
+        normalized_graphs,
+        batch_size=args.batch_size,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+        shuffle=True,
+    )
+    print(f"DataLoader created with batch size {args.batch_size}.")
 
     # Model
     model_config = ModelConfig(

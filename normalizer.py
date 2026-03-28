@@ -1,5 +1,6 @@
 import torch
 from torch_geometric.data import Data
+from tqdm import tqdm
 
 
 class Normalizer:
@@ -26,12 +27,50 @@ class Normalizer:
         self.F_MAX = 1.0  # Max force for normalization
 
     def fit(self, graphs: list[Data]):
-        all_pos = torch.cat([g.x[:, :3] for g in graphs], dim=0)
-        all_edge = torch.cat([g.edge_attr for g in graphs], dim=0)
+        total_nodes = 0
+        total_edges = 0
+        pos_sum, pos_sq_sum = 0.0, 0.0
+        edge_sum, edge_sq_sum = 0.0, 0.0
+        y_sum, y_sq_sum = 0.0, 0.0
 
-        all_y = torch.cat([g.y for g in graphs], dim=0)
+        for g in tqdm(graphs, desc="Fitting Normalizer"):
+            pos = g.x[:, :3].to(self.device)
+            edge = g.edge_attr.to(self.device)
+            y = g.y.to(self.device)
 
-        self._set_stats(all_pos, all_y, all_edge)
+            total_nodes += pos.shape[0]
+            total_edges += edge.shape[0]
+
+            pos_sum += pos.sum(dim=0)
+            pos_sq_sum += (pos**2).sum(dim=0)
+
+            edge_sum += edge.sum(dim=0)
+            edge_sq_sum += (edge**2).sum(dim=0)
+
+            y_sum += y.sum(dim=0)
+            y_sq_sum += (y**2).sum(dim=0)
+
+        self.pos_mean = pos_sum / total_nodes
+        self.edge_mean = edge_sum / total_edges
+        self.y_mean = y_sum / total_nodes
+
+        pos_var = (pos_sq_sum / total_nodes) - (self.pos_mean**2)
+        self.pos_std = torch.sqrt(torch.clamp(pos_var, min=0.0)) + 1e-6
+
+        edge_var = (edge_sq_sum / total_edges) - (self.edge_mean**2)
+        self.edge_std = torch.sqrt(torch.clamp(edge_var, min=0.0)) + 1e-6
+
+        y_var = (y_sq_sum / total_nodes) - (self.y_mean**2)
+        self.y_std = torch.sqrt(torch.clamp(y_var, min=0.0)) + 1e-6
+
+        self.stats = {
+            "pos_mean": self.pos_mean,
+            "pos_std": self.pos_std,
+            "y_mean": self.y_mean,
+            "y_std": self.y_std,
+            "e_mean": self.edge_mean,
+            "e_std": self.edge_std,
+        }
 
     def _set_stats(self, all_pos, all_y, all_edge):
         """Helper to dictionary-ize the stats."""
