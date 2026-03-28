@@ -269,23 +269,17 @@ def prepare_graphs(
         List of normalised graph objects with a ``weight`` attribute.
     """
     mode = "weighted" if weighted_loss else "all"
-    normalized_graphs = []
 
     for graph in graphs:
-        graph_norm = normalizer.normalize(graph)
         weight = get_weight(
             graph.x[:, 2],
             num_targets,
             mode=mode,
             alpha=alpha,
         )
-
-        # Only weight physical nodes, not virtual nodes
-        weight = weight * (graph.x[:, -1] != 1.0).unsqueeze(1).float()
-        graph_norm.weight = weight
-        normalized_graphs.append(graph_norm)
-
-    return normalized_graphs
+        weight.mul_((graph.x[:, -1] != 1.0).unsqueeze(1).float())
+        normalizer.normalize_(graph)
+        graph.weight = weight
 
 
 # ---------------------------------------------------------------------------
@@ -569,17 +563,16 @@ def main():
         args.log_loss, params["node_dim"], params["num_categorical"]
     )
     normalizer.fit(graphs)
-    print("Fitted normalizer to training data.")
 
     # Data
     target_indices = get_target_indices(args.target)
-    normalized_graphs = prepare_graphs(
+    prepare_graphs(
         graphs, normalizer, args.weighted_loss, args.alpha, len(target_indices)
     )
-    print(f"Prepared {len(normalized_graphs)} normalised graphs for training.")
+    print(f"Normalized {len(graphs)} graphs for training.")
 
     loader = DataLoader(
-        normalized_graphs,
+        graphs,
         batch_size=args.batch_size,
         num_workers=4,
         pin_memory=True,

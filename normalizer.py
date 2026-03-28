@@ -1,5 +1,6 @@
 import torch
 from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
 
@@ -27,16 +28,26 @@ class Normalizer:
         self.F_MAX = 1.0  # Max force for normalization
 
     def fit(self, graphs: list[Data]):
+        loader = DataLoader(
+            graphs,
+            batch_size=64,
+            shuffle=False,
+            num_workers=8,
+            pin_memory=(self.device != "cpu"),  # Speeds up transfer to GPU
+        )
+
         total_nodes = 0
         total_edges = 0
         pos_sum, pos_sq_sum = 0.0, 0.0
         edge_sum, edge_sq_sum = 0.0, 0.0
         y_sum, y_sq_sum = 0.0, 0.0
 
-        for g in tqdm(graphs, desc="Fitting Normalizer"):
-            pos = g.x[:, :3].to(self.device)
-            edge = g.edge_attr.to(self.device)
-            y = g.y.to(self.device)
+        for batch in tqdm(loader, desc="Fitting Normalizer"):
+            batch = batch.to(self.device)
+
+            pos = batch.x[:, :3]
+            edge = batch.edge_attr
+            y = batch.y
 
             total_nodes += pos.shape[0]
             total_edges += edge.shape[0]
@@ -107,6 +118,12 @@ class Normalizer:
         g.edge_attr = (g.edge_attr - self.edge_mean) / self.edge_std
         g.y = (g.y - self.y_mean) / self.y_std
         return g
+
+    def normalize_(self, graph: Data) -> Data:
+        graph.x[:, self.pos_mask] = self._normalize_pos(graph.x[:, self.pos_mask])
+        graph.x[:, self.force_mask] = self._normalize_force(graph.x[:, self.force_mask])
+        graph.edge_attr = (graph.edge_attr - self.edge_mean) / self.edge_std
+        graph.y = (graph.y - self.y_mean) / self.y_std
 
     def denormalize_y(self, y: torch.Tensor) -> torch.Tensor:
         return y * self.y_std + self.y_mean
