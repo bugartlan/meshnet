@@ -179,7 +179,9 @@ class Simulator:
 
     #     return samples.point_data["values"].reshape(-1, bs)
 
-    def probe(self, func: fem.Function, points: np.ndarray) -> np.ndarray:
+    def probe(
+        self, func: fem.Function, points: np.ndarray, clip: bool = False
+    ) -> np.ndarray:
         points = np.asarray(points, dtype=np.float64)
         n_points = len(points)
         bs = func.function_space.dofmap.index_map_bs
@@ -254,7 +256,10 @@ class Simulator:
             distances, nearest_dof_indices = tree.query(missing_points, k=1)
             values[missing_idx] = nodal_values[nearest_dof_indices]
 
-        return values.clip(min=0.0)  # Ensure non-negative values
+        if clip:
+            values = values.clip(min=0.0)  # Ensure non-negative values
+
+        return values
 
     def plot_displacement(self, uh):
         topology, cell_types, geometry = plot.vtk_mesh(uh.function_space)

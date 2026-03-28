@@ -43,7 +43,7 @@ class DataGenerator:
 
         self.num_samples = num_samples
         self.num_contacts = num_contacts
-        self.num_force_per_sample = 10
+        self.num_force_per_sample = 5
         self.force_max = force_max
         self.sigma = sigma
         self.seed = seed
@@ -117,7 +117,12 @@ class DataGenerator:
             uh = simulator.run(contacts)
             vm = simulator.compute_vm1(uh)
             results.append(
-                np.hstack([simulator.probe(uh, queries), simulator.probe(vm, queries)])
+                np.hstack(
+                    [
+                        simulator.probe(uh, queries),
+                        simulator.probe(vm, queries, clip=True),
+                    ]
+                )
             )
 
         return results
