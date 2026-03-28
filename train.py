@@ -8,7 +8,6 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils.tensorboard import SummaryWriter
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
@@ -391,7 +390,6 @@ def train_one_epoch(
     target_indices: list[int],
     device: torch.device,
     use_amp: bool,
-    trace_dir: Path,
 ) -> float:
     """Run one full pass over *loader* and return the average weighted MSE loss.
 
@@ -403,7 +401,6 @@ def train_one_epoch(
         target_indices: Output column indices included in the loss.
         device: Compute device.
         use_amp: Whether to use automatic mixed precision.
-        trace_dir: Directory where TensorBoard profiler traces are written.
 
     Returns:
         Average loss per node across all batches.
@@ -419,40 +416,24 @@ def train_one_epoch(
     total_loss = 0.0
     total_nodes = 0
 
-    trace_dir.mkdir(parents=True, exist_ok=True)
+    for batch in loader:
+        batch = batch.to(device)
+        optimizer.zero_grad()
 
-    with torch.profiler.profile(
-        activities=[
-            ProfilerActivity.CPU,
-            ProfilerActivity.CUDA,
-        ],
-        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(str(trace_dir)),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,  # Maps GPU ops back to your exact Python lines!
-    ) as prof:
-        for i, batch in enumerate(loader):
-            batch = batch.to(device, non_blocking=True)
-            optimizer.zero_grad()
+        with autocast_ctx:
+            y_pred = model(batch)[:, target_indices]
+            y_true = batch.y[:, target_indices]
+            loss = F.mse_loss(y_pred, y_true, weight=batch.weight)
 
-            with autocast_ctx:
-                y_pred = model(batch)[:, target_indices]
-                y_true = batch.y[:, target_indices]
-                loss = F.mse_loss(y_pred, y_true, weight=batch.weight)
+        if torch.isnan(loss):
+            raise ValueError("Loss is NaN. Check data and model for issues.")
 
-            if torch.isnan(loss):
-                raise ValueError("Loss is NaN. Check data and model for issues.")
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            total_loss += loss.item() * batch.num_nodes
-            total_nodes += batch.num_nodes
-            prof.step()
-            if i > 5:
-                break
+        total_loss += loss.item() * batch.num_nodes
+        total_nodes += batch.num_nodes
 
     return total_loss / total_nodes
 
@@ -467,7 +448,6 @@ def train_model(
     device: torch.device,
     num_epochs: int,
     writer: SummaryWriter | None,
-    trace_dir: Path,
     checkpoint_cfg: CheckpointConfig,
     checkpoint_interval: int = 50,
 ) -> list[float]:
@@ -483,7 +463,6 @@ def train_model(
         device: Compute device.
         num_epochs: Total number of training epochs.
         writer: Optional TensorBoard writer; ``None`` disables TB logging.
-        trace_dir: Directory where profiler traces are written.
         checkpoint_cfg: Configuration for periodic checkpoint saving.
         checkpoint_interval: Save a checkpoint every this many epochs.
 
@@ -498,7 +477,7 @@ def train_model(
 
     for epoch in progress_bar:
         avg_loss = train_one_epoch(
-            model, loader, optimizer, scaler, target_indices, device, use_amp, trace_dir
+            model, loader, optimizer, scaler, target_indices, device, use_amp
         )
         scheduler.step()
         loss_history.append(avg_loss)
@@ -510,6 +489,7 @@ def train_model(
         if (epoch + 1) % checkpoint_interval == 0:
             checkpoint_path = checkpoint_cfg.directory / f"model{epoch + 1}.pth"
             save_checkpoint(checkpoint_path, model, checkpoint_cfg)
+            print(f"Saved checkpoint at epoch {epoch + 1}: {checkpoint_path}")
 
         if (epoch + 1) % 10 == 0:
             progress_bar.set_description(
@@ -586,14 +566,7 @@ def main():
     normalized_graphs = prepare_graphs(
         graphs, normalizer, args.weighted_loss, args.alpha, len(target_indices)
     )
-    loader = DataLoader(
-        normalized_graphs,
-        batch_size=args.batch_size,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True,
-        shuffle=True,
-    )
+    loader = DataLoader(normalized_graphs, batch_size=args.batch_size, shuffle=True)
 
     # Model
     model_config = ModelConfig(
@@ -619,9 +592,7 @@ def main():
     checkpoint_dir = args.log_dir / model_name / time.strftime("%Y%m%d-%H%M%S")
     setup_directories(args, checkpoint_dir)
     writer, log_path = create_tensorboard_writer(args, model_name)
-    trace_dir = args.log_dir / model_name / "profiler"
     print(f"Checkpoint directory: {checkpoint_dir}")
-    print(f"Profiler traces saved to: {trace_dir}")
 
     checkpoint_cfg = CheckpointConfig(
         directory=checkpoint_dir,
@@ -642,7 +613,6 @@ def main():
         device=device,
         num_epochs=args.epochs,
         writer=writer,
-        trace_dir=trace_dir,
         checkpoint_cfg=checkpoint_cfg,
         checkpoint_interval=50,
     )
