@@ -1,6 +1,7 @@
 import meshio
 import numpy as np
 import pyvista
+import scipy
 import trimesh
 import ufl
 from dolfinx import default_scalar_type, fem, geometry, mesh, plot
@@ -12,9 +13,7 @@ from utils import msh_to_trimesh
 
 
 class Simulator:
-    def __init__(
-        self, filename_msh: str, contact_radius: float = 0.01, std: float = 0.001
-    ):
+    def __init__(self, filename_msh: str, std: float = 0.001):
         self.std = std
 
         # Load mesh from .msh file
@@ -166,7 +165,9 @@ class Simulator:
         vm1.x.array[:] = np.clip(vm1.x.array, 0, None)
         return vm1
 
-    def probe(self, func: fem.Function, points: np.ndarray) -> np.ndarray:
+    def probe(
+        self, func: fem.Function, points: np.ndarray, clip: bool = False
+    ) -> np.ndarray:
         points = np.asarray(points, dtype=np.float64)
         n_points = len(points)
         bs = func.function_space.dofmap.index_map_bs
@@ -234,18 +235,17 @@ class Simulator:
         # Final fallback: interpolate from nodal values (guarantees no missing labels).
         missing_idx = np.where(~found)[0]
         if len(missing_idx) > 0:
-            topology, cell_types, geom = plot.vtk_mesh(func.function_space)
-            grid = pyvista.UnstructuredGrid(topology, cell_types, geom)
-            grid.point_data["values"] = func.x.array.real.reshape(-1, bs)
+            dof_coords = func.function_space.tabulate_dof_coordinates()
+            nodal_values = func.x.array.real.reshape(-1, bs)
+            tree = scipy.spatial.KDTree(dof_coords)
+            missing_points = points[missing_idx]
+            distances, nearest_dof_indices = tree.query(missing_points, k=1)
+            values[missing_idx] = nodal_values[nearest_dof_indices]
 
-            cloud = pyvista.PolyData(points[missing_idx])
-            radius = 2.0 * np.linalg.norm(
-                self.domain.geometry.x.max(axis=0) - self.domain.geometry.x.min(axis=0)
-            )
-            sampled = cloud.interpolate(grid, radius=radius, sharpness=1.0)
-            values[missing_idx] = sampled.point_data["values"].reshape(-1, bs)
+        if clip:
+            values = values.clip(min=0.0)  # Ensure non-negative values
 
-        return values.clip(min=0.0)  # Ensure non-negative values
+        return values
 
     def plot_displacement(self, uh):
         topology, cell_types, geometry = plot.vtk_mesh(uh.function_space)

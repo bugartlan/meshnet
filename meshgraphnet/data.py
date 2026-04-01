@@ -42,6 +42,7 @@ class DataGenerator:
 
         self.num_samples = num_samples
         self.num_contacts = num_contacts
+        self.num_force_per_sample = 5
         self.force_max = force_max
         self.sigma = sigma
         self.seed = seed
@@ -65,7 +66,6 @@ class DataGenerator:
         mesh_cg2 = meshio.read(msh_path_cg2)
 
         points, forces = self._sample(mesh_cg2)
-        # results = self._simulate(msh_path_cg1, points, forces, mesh_cg1.points)
         results = self._simulate(msh_path_cg2, points, forces, mesh_cg1.points)
 
         graphs = []
@@ -80,10 +80,10 @@ class DataGenerator:
         # Sample 2x buffer to account for filtering
         mesh = msh_to_trimesh(mesh)
         candidates, _ = trimesh.sample.sample_surface(
-            mesh, count=num_total_points * 3, seed=self.seed
+            mesh, count=num_total_points * 5, seed=self.seed
         )
         # Remove point near bottom (z=0)
-        candidates = candidates[candidates[:, 2] > 0.002]
+        candidates = candidates[candidates[:, 2] > 0.004]
         candidates = candidates[:num_total_points]
 
         if len(candidates) < num_total_points:
@@ -94,10 +94,12 @@ class DataGenerator:
         points = candidates.reshape(self.num_samples, self.num_contacts, 3)
 
         # Sample random forces
-        forces = self.rng.standard_normal(size=(self.num_samples, self.num_contacts, 3))
+        forces = self.rng.standard_normal(
+            size=(self.num_samples * self.num_force_per_sample, self.num_contacts, 3)
+        )
         forces = forces / np.linalg.norm(forces, axis=-1, keepdims=True)
 
-        return points, forces
+        return np.repeat(points, self.num_force_per_sample, axis=0), forces
 
     def _simulate(
         self,
@@ -114,7 +116,12 @@ class DataGenerator:
             uh = simulator.run(contacts)
             vm = simulator.compute_vm1(uh)
             results.append(
-                np.hstack([simulator.probe(uh, queries), simulator.probe(vm, queries)])
+                np.hstack(
+                    [
+                        simulator.probe(uh, queries),
+                        simulator.probe(vm, queries, clip=True),
+                    ]
+                )
             )
 
         return results
@@ -175,7 +182,7 @@ def main():
 
     for f in files:
         graphs = generator.process(f)
-        out_path = args.out_dir / (f.stem.replace("cg1", f"{args.num_samples}") + ".pt")
+        out_path = args.out_dir / (f.stem.replace("cg1", f"{len(graphs)}") + ".pt")
 
         node_dim, edge_dim, output_dim = info(graphs[0])
         num_categorical = generator.builder.num_categorical

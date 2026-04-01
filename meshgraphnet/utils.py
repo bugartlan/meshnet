@@ -183,7 +183,7 @@ def get_weight(
     if weight.dim() == 1:
         weight = weight.unsqueeze(-1)
 
-    return weight.expand(z.shape[0], dim)
+    return weight.repeat(1, dim)
 
 
 def grad_u(graph: Data):
