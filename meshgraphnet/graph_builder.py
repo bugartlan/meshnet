@@ -315,7 +315,7 @@ class GraphBuilderVirtual(GraphBuilderBase):
 
         # Match base edge features: [dx, dy, dz, distance] for directed edges.
         phys_coords = torch.as_tensor(mesh.points, dtype=torch.float32)
-        virt_coords = torch.tensor([p for p, _ in contacts], dtype=torch.float32)
+        virt_coords = torch.from_numpy(np.stack([p for p, _ in contacts])).float()
         all_coords = torch.vstack([phys_coords, virt_coords])
 
         src, dst = edge_index
