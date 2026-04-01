@@ -110,6 +110,22 @@ class Normalizer:
     def _normalize_force(self, x: torch.Tensor) -> torch.Tensor:
         return x / self.F_MAX
 
+    def to(self, device):
+        """Move all normalization statistics to the target device."""
+        self.device = device
+        for key in self.stats:
+            self.stats[key] = self.stats[key].to(device)
+        # Update internal attribute references
+        self.pos_mean = self.stats["pos_mean"]
+        self.pos_std = self.stats["pos_std"]
+        self.edge_mean = self.stats["e_mean"]
+        self.edge_std = self.stats["e_std"]
+        self.y_mean = self.stats["y_mean"]
+        self.y_std = self.stats["y_std"]
+        self.pos_mask = self.pos_mask.to(device)
+        self.force_mask = self.force_mask.to(device)
+        return self
+
     def normalize(self, graph: Data) -> Data:
         g = graph.clone()
 
@@ -124,6 +140,20 @@ class Normalizer:
         graph.x[:, self.force_mask] = self._normalize_force(graph.x[:, self.force_mask])
         graph.edge_attr = (graph.edge_attr - self.edge_mean) / self.edge_std
         graph.y = (graph.y - self.y_mean) / self.y_std
+
+    def normalize_batch(self, batch: Data) -> Data:
+        """In-place normalization of a batched Data object."""
+        batch.x[:, self.pos_mask] = (
+            batch.x[:, self.pos_mask] - self.pos_mean
+        ) / self.pos_std
+
+        # Vectorized Force Normalization
+        batch.x[:, self.force_mask] = batch.x[:, self.force_mask] / self.F_MAX
+
+        # Vectorized Edge and Target Normalization
+        batch.edge_attr = (batch.edge_attr - self.edge_mean) / self.edge_std
+        batch.y = (batch.y - self.y_mean) / self.y_std
+        return batch
 
     def denormalize_y(self, y: torch.Tensor) -> torch.Tensor:
         return y * self.y_std + self.y_mean

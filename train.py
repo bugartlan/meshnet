@@ -9,6 +9,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+from torch_geometric.data import Batch
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
@@ -270,7 +271,7 @@ def prepare_graphs(
     """
     mode = "weighted" if weighted_loss else "all"
 
-    for graph in graphs:
+    for graph in tqdm(graphs, desc="Preparing graphs", dynamic_ncols=True):
         weight = get_weight(
             graph.x[:, 2],
             num_targets,
@@ -280,6 +281,48 @@ def prepare_graphs(
         weight.mul_((graph.x[:, -1] != 1.0).unsqueeze(1).float())
         normalizer.normalize_(graph)
         graph.weight = weight
+
+
+def prepare_graphs_fast(
+    graphs,
+    normalizer,
+    weighted_loss: bool,
+    alpha: float,
+    num_targets: int,
+    device="cpu",
+):
+    """Refactored to process all graphs at once on the GPU/CPU."""
+    mode = "weighted" if weighted_loss else "all"
+
+    # 1. Collate all individual graphs into one giant Batch
+    batch = Batch.from_data_list(graphs).to(device)
+    normalizer.to(device)
+
+    # 2. Compute weights for EVERY node in the dataset simultaneously
+    # This assumes get_weight is written using torch operations
+    weights = get_weight(
+        batch.x[:, 2],
+        num_targets,
+        mode=mode,
+        alpha=alpha,
+    )
+
+    # 3. Apply physical node mask (vectorized)
+    # batch.x[:, -1] is the categorical 'node type' column
+    is_physical = (batch.x[:, -1] != 1.0).unsqueeze(1).float()
+    batch.weight = weights * is_physical
+
+    # 4. Normalize the entire batch in one call
+    batch = normalizer.normalize_batch(batch)
+
+    # 5. Explode back into a list of individual graphs for the DataLoader
+    graphs_out = batch.to_data_list()
+    for i, g in enumerate(graphs_out):
+        s = int(batch.ptr[i].item())
+        e = int(batch.ptr[i + 1].item())
+        g.weight = weights[s:e]
+
+    return graphs_out
 
 
 # ---------------------------------------------------------------------------
@@ -566,10 +609,11 @@ def main():
 
     # Data
     target_indices = get_target_indices(args.target)
-    prepare_graphs(
+    start = time.time()
+    graphs = prepare_graphs_fast(
         graphs, normalizer, args.weighted_loss, args.alpha, len(target_indices)
     )
-    print(f"Normalized {len(graphs)} graphs for training.")
+    print(f"Normalized {len(graphs)} graphs in {time.time() - start:.2f}s.")
 
     loader = DataLoader(
         graphs,

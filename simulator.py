@@ -164,21 +164,6 @@ class Simulator:
         vm1.x.scatter_forward()
         return vm1
 
-    # def probe(self, func: fem.Function, points: np.ndarray) -> np.ndarray:
-    #     """
-    #     Probe the function `func` at the given `points`.
-    #     This method uses PyVista to interpolate the function values at the specified points.
-    #     """
-    #     topology, cell_types, geometry = plot.vtk_mesh(func.function_space)
-    #     grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
-    #     bs = func.function_space.dofmap.index_map_bs
-    #     grid.point_data["values"] = func.x.array.real.reshape(-1, bs)
-    #     cloud = pyvista.PolyData(points)
-    #     samples = cloud.interpolate(grid, sharpness=20)
-    #     # samples = cloud.sample(grid)
-
-    #     return samples.point_data["values"].reshape(-1, bs)
-
     def probe(
         self, func: fem.Function, points: np.ndarray, clip: bool = False
     ) -> np.ndarray:

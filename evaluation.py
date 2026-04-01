@@ -15,7 +15,7 @@ from normalizer import LogNormalizer, Normalizer
 from simulator import Simulator
 from utils import get_weight, msh_to_trimesh
 
-DATA_FILE = "data/T-Bracket2_100.pt"
+DATA_FILE = "data/L-Bracket4_100.pt"
 CHECKPOINT_FILE = "models/Train_all_w.pth"
 TARGET_INDEX = 3
 
@@ -24,6 +24,7 @@ TARGET_INDEX = 3
 class EvalSummary:
     mae: float
     mae75: float
+    node_pct_err: float
     kendall_tau: float
     elapsed_s: float
 
@@ -156,6 +157,7 @@ def evaluate_encode_process_decode(
 
     maes = []
     maes75 = []
+    node_pct_errs = []
     taus = []
 
     start = time.time()
@@ -174,6 +176,7 @@ def evaluate_encode_process_decode(
             maes.append(mae)
             maes75.append(mae75(pred_np, true_np, weight_np))
             taus.append(compute_kendall_tau(pred_np, true_np, weight_np))
+            node_pct_errs.append(100 * mae / (np.max(true_np * weight_np) + 1e-8))
     elapsed = time.time() - start
 
     return EvalSummary(
@@ -181,6 +184,7 @@ def evaluate_encode_process_decode(
         mae75=aggregate(maes75),
         kendall_tau=aggregate(taus),
         elapsed_s=elapsed,
+        node_pct_err=aggregate(node_pct_errs),
     )
 
 
@@ -202,6 +206,7 @@ def evaluate_simulator(
     maes = []
     maes75 = []
     taus = []
+    node_pct_errs = []
 
     start = time.time()
     for g in graphs_raw:
@@ -222,6 +227,7 @@ def evaluate_simulator(
         maes.append(mae)
         maes75.append(mae75(pred_np, true_np, weight_np))
         taus.append(compute_kendall_tau(pred_np, true_np, weight_np))
+        node_pct_errs.append(100 * mae / (np.mean(true_np * weight_np) + 1e-8))
     elapsed = time.time() - start
 
     return EvalSummary(
@@ -229,6 +235,7 @@ def evaluate_simulator(
         mae75=aggregate(maes75),
         kendall_tau=aggregate(taus),
         elapsed_s=elapsed,
+        node_pct_err=aggregate(node_pct_errs),
     )
 
 
@@ -245,18 +252,21 @@ def print_comparison(epd: EvalSummary, sim: EvalSummary):
     print("-" * 60)
     print(f"{'MAE':<18}{epd.mae:>20.6f}{sim.mae:>14.6f}")
     print(f"{'MAE75':<18}{epd.mae75:>20.6f}{sim.mae75:>14.6f}")
+    print(f"{'Node % Error':<18}{epd.node_pct_err:>20.2f}%{sim.node_pct_err:>14.2f}%")
     print(f"{'Kendall Tau':<18}{epd.kendall_tau:>20.4f}{sim.kendall_tau:>14.4f}")
     print(f"{'Runtime (s)':<18}{epd.elapsed_s:>20.2f}{sim.elapsed_s:>14.2f}")
     print("-" * 60)
 
     mae_delta = pct_change(sim.mae, epd.mae)
     mae75_delta = pct_change(sim.mae75, epd.mae75)
+    node_pct_delta = pct_change(sim.node_pct_err, epd.node_pct_err)
     tau_delta = epd.kendall_tau - sim.kendall_tau
     speedup = sim.elapsed_s / epd.elapsed_s if epd.elapsed_s > 0 else float("nan")
 
     print("Relative difference of EncodeProcessDecode against Simulator:")
     print(f"  MAE:     {mae_delta:+.2f}% (lower is better)")
     print(f"  MAE75:   {mae75_delta:+.2f}% (lower is better)")
+    print(f"  Node % Error: {node_pct_delta:+.2f}% (lower is better)")
     print(f"  Tau:     {tau_delta:+.4f} (higher is better)")
     print(f"  Speedup: {speedup:.2f}x faster")
 
