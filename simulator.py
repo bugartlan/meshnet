@@ -165,7 +165,7 @@ class Simulator:
         return vm1
 
     def probe(
-        self, func: fem.Function, points: np.ndarray, clip: bool = False
+        self, func: fem.Function, points: np.ndarray, clip: bool = True
     ) -> np.ndarray:
         points = np.asarray(points, dtype=np.float64)
         n_points = len(points)

@@ -15,8 +15,8 @@ from normalizer import LogNormalizer, Normalizer
 from simulator import Simulator
 from utils import get_weight, msh_to_trimesh
 
-DATA_FILE = "data/L-Bracket4_100.pt"
-CHECKPOINT_FILE = "models/Train_all_w.pth"
+DATA_FILE = "data/Bushing2_100.pt"
+CHECKPOINT_FILE = "models/Model0.pth"
 TARGET_INDEX = 3
 
 
@@ -227,7 +227,8 @@ def evaluate_simulator(
         maes.append(mae)
         maes75.append(mae75(pred_np, true_np, weight_np))
         taus.append(compute_kendall_tau(pred_np, true_np, weight_np))
-        node_pct_errs.append(100 * mae / (np.mean(true_np * weight_np) + 1e-8))
+        node_pct_errs.append(100 * mae / (np.max(true_np * weight_np) + 1e-8))
+
     elapsed = time.time() - start
 
     return EvalSummary(
@@ -346,6 +347,7 @@ def plot_sample_predictions(
     graph_sim = _run_simulator_sample_prediction(graph_true, mesh, msh_path)
 
     clim = _stress_clim(mode, graph_true, graph_epd, graph_sim)
+    print(f"\nColor scale limits for stress plots: {clim}")
 
     out_dir = Path(plots_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
