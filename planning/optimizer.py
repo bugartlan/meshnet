@@ -77,16 +77,45 @@ def sample_wrenches(
     return w
 
 
-def sample_contact_forces(contact: Contact, fmin: float, fmax: float) -> np.ndarray:
-    """Sample a random contact force vector within the friction cone."""
-    # Sample a random direction in the tangent plane
-    tangent = np.random.randn(3)
-    tangent -= tangent.dot(contact.normal) * contact.normal  # project to tangent plane
-    tangent /= np.linalg.norm(tangent) + 1e-8  # normalize
+def sample_contact_forces(contact: Contact) -> np.ndarray:
+    """Sample a random contact force inside the Coulomb friction cone.
 
-    # Sample a random magnitude within the friction cone
-    alpha = np.random.rand() * (fmax - fmin) + fmin  # scale to desired range
-    return alpha * tangent + contact.normal  # total contact force vector
+    Assumes ``contact.normal`` points outward from the object surface, so the
+    contact force on the object is along ``-normal`` plus a tangential term.
+    """
+
+    normal = contact.normal / (np.linalg.norm(contact.normal) + 1e-8)
+
+    # Random unit tangent direction orthogonal to the contact normal.
+    tangent = np.random.randn(3)
+    tangent -= tangent.dot(normal) * normal
+    tangent_norm = np.linalg.norm(tangent)
+    if tangent_norm < 1e-8:
+        # Deterministic fallback tangent if random projection is nearly zero.
+        basis = (
+            np.array([1.0, 0.0, 0.0])
+            if abs(normal[0]) < 0.9
+            else np.array([0.0, 1.0, 0.0])
+        )
+        tangent = np.cross(normal, basis)
+        tangent_norm = np.linalg.norm(tangent)
+    tangent /= tangent_norm
+
+    ft = np.sqrt(np.random.rand()) * contact.mu
+
+    return -normal + ft * tangent
+
+
+def contact_forces_to_wrench(
+    f1: np.ndarray, f2: np.ndarray, p1: np.ndarray, p2: np.ndarray
+) -> np.ndarray:
+    """Convert two contact forces at given points into a wrench on the object.
+
+    p1 and p2 are relative to the object's center of mass.
+    """
+    torque1 = np.cross(p1, f1)
+    torque2 = np.cross(p2, f2)
+    return np.concatenate([f1 + f2, torque1 + torque2])
 
 
 class GraspOptimizer(ABC):
@@ -127,45 +156,46 @@ class GNNBasedGraspOptimizer(GraspOptimizer):
         y0 = np.zeros((num_nodes, 4))  # dummy node features
 
         sampler = GraspSampler(mesh, self.gripper, mu)
-        grasps = sampler.sample(n_samples=100)
+        grasps = sampler.sample(n_samples=500)
         if not grasps:
             print("No valid grasps found!")
             return None
 
-        # Sample wrenches
-        wrenches = sample_wrenches(k, force_scale=1.0, torque_scale=0.1)
-
         # Build graph and predict scores for each grasp
-        graphs = []
+        optimal_grasps = []
         for grasp in grasps:
             pos1 = grasp.c1.pos - pos_com
             pos2 = grasp.c2.pos - pos_com
+
+            best_wrench = None
+            best_score = 0.0
+
+            wrenches = sample_wrenches(k, force_scale=1.0, torque_scale=0.0)
             for wrench in wrenches:
                 f1, f2 = wrench_to_contact_forces(wrench, pos1, pos2)
                 grip = 0.1 * (pos1 - pos2) / grasp.width
-                contacts = [(pos1, f1 - grip / 2), (pos2, f2 + grip / 2)]
-                graph = self.builder.build(msh, y0, contacts)
-                graphs.append(
-                    (
-                        graph.to(self.device),
-                        Grasp(
-                            pose=grasp.pose,
-                            width=grasp.width,
-                            c1=grasp.c1,
-                            c2=grasp.c2,
-                            wrench=wrench,
-                        ),
-                    )
+                contacts = [
+                    (grasp.c1.pos, f1 - grip / 2),
+                    (grasp.c2.pos, f2 + grip / 2),
+                ]
+                graph = self.builder.build(msh, y0, contacts).to(self.device)
+                y_pred = self.model(self.normalizer.normalize(graph))
+                y_pred = self.normalizer.denormalize_y(y_pred)
+                score = torch.max(y_pred[graph.x[:, 2] < self.epsilon, 3]).item()
+                if score > best_score:
+                    best_score = score
+                    best_wrench = wrench
+            optimal_grasps.append(
+                (
+                    best_score,
+                    Grasp(
+                        pose=grasp.pose,
+                        width=grasp.width,
+                        c1=grasp.c1,
+                        c2=grasp.c2,
+                        wrench=best_wrench,
+                    ),
                 )
+            )
 
-        best_grasp = None
-        max_score = -np.inf
-        for graph, grasp in graphs:
-            y_pred = self.model(self.normalizer.normalize(graph))
-            y_pred = self.normalizer.denormalize_y(y_pred)
-            score = torch.max(y_pred[graph.x[:, 2] < self.epsilon, 3])
-            if score > max_score:
-                max_score = score
-                best_grasp = grasp
-
-        return best_grasp
+        return sorted(optimal_grasps, key=lambda x: x[0], reverse=True)

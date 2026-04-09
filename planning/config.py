@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+import numpy as np
 import trimesh
 
 
@@ -43,6 +44,16 @@ class ROBOTIQ_HANDE_GRIPPER:
     box_finger_left: BoxFinger = BoxFinger()
     box_finger_right: BoxFinger = BoxFinger()
     cylinder_body: CylinderBody = CylinderBody()
+
+    def tf_fingertip_to_base(self):
+        tf = np.eye(4)
+        tf[2, 3] = -self.base_to_fingertip
+        return tf
+
+    def tf_base_to_fingertip(self):
+        tf = np.eye(4)
+        tf[2, 3] = self.base_to_fingertip
+        return tf
 
     def show(self, viewer="gl"):
         scene = trimesh.Scene()

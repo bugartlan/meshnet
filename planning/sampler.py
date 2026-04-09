@@ -185,3 +185,4 @@ class GraspSampler:
         )
 
         scene.show(viewer=viewer)
+        return scene
