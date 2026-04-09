@@ -224,12 +224,14 @@ class GraphBuilderVirtual(GraphBuilderBase):
     def build(
         self,
         mesh: meshio.Mesh,
-        y: np.ndarray,
+        y: np.ndarray | None = None,
         contacts: list[tuple] | None = None,
     ) -> Data:
         contacts = contacts or []
 
-        if y.shape[0] != mesh.points.shape[0]:
+        if y is None:
+            y = np.zeros((mesh.points.shape[0], 4), dtype=np.float32)
+        elif y.shape[0] != mesh.points.shape[0]:
             raise ValueError(
                 f"Output array y must have shape [num_nodes, num_output_features], but got {y.shape} and {mesh.points.shape[0]} nodes."
             )
