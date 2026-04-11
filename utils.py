@@ -5,6 +5,25 @@ import trimesh
 from torch_geometric.data import Data
 
 
+def info(graph: Data, debug=False):
+    graph.validate(raise_on_error=True)
+
+    node_dim = graph.num_node_features
+    edge_dim = graph.num_edge_features
+    output_dim = graph.y.shape[1]
+
+    if debug:
+        print("Node feature dim:", node_dim)
+        print("Edge feature dim:", edge_dim)
+        print("Output dim:", output_dim)
+
+        print("Keys:", graph.keys())
+        print("Number of nodes:", graph.num_nodes)
+        print("Number of edges:", graph.num_edges)
+
+    return node_dim, edge_dim, output_dim
+
+
 def msh_to_trimesh(mesh: meshio.Mesh) -> trimesh.Trimesh:
     """
     Convert a meshio.Mesh to a trimesh.Trimesh object.

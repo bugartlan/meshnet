@@ -15,7 +15,7 @@ from normalizer import LogNormalizer, Normalizer
 from simulator import Simulator
 from utils import get_weight, msh_to_trimesh
 
-DATA_FILE = "data/Bushing2_100.pt"
+DATA_FILE = "data/L-Bracket3_100.pt"
 CHECKPOINT_FILE = "models/Model0.pth"
 TARGET_INDEX = 3
 
