@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import meshio
 import numpy as np
 import pyvista as pv
@@ -338,11 +340,15 @@ class GraphVisualizer:
         self,
         graph: Data,
         clim: tuple = None,
+        show_contacts: bool = True,
         save_path: str | None = None,
         debug: bool = False,
+        scalar_bar_args: dict | None = None,
     ):
         n_phys = graph.num_physical_nodes
-        self.pv_mesh.point_data["von_mises"] = graph.y.numpy()[:n_phys, 3]
+        self.pv_mesh.point_data["von_mises"] = (
+            graph.y.detach().cpu().numpy()[:n_phys, 3]
+        )
 
         plotter = pv.Plotter(notebook=self.jupyter_backend)
         plotter.add_mesh(
@@ -352,12 +358,13 @@ class GraphVisualizer:
             render_points_as_spheres=True,
             show_edges=True,
             clim=clim,
+            scalar_bar_args=scalar_bar_args,
         )
 
         x_min, x_max, y_min, y_max, z_min, z_max = self.pv_mesh.bounds
         scale = max(x_max - x_min, y_max - y_min, z_max - z_min) * 0.1
 
-        if hasattr(graph, "contacts") and graph.contacts is not None:
+        if show_contacts and hasattr(graph, "contacts") and graph.contacts is not None:
             for p, f in graph.contacts:
                 if debug:
                     print(f"Contact point: {p}, Force: {f}")
@@ -373,7 +380,16 @@ class GraphVisualizer:
 
         plotter.show_axes()
         if save_path is not None:
-            plotter.export_html(save_path)
+            suffix = Path(save_path).suffix.lower()
+            if suffix in {".html", ".htm"}:
+                plotter.export_html(save_path)
+            elif suffix in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}:
+                plotter.window_size = (1600, 1000)
+                plotter.show(screenshot=save_path)
+            else:
+                raise ValueError(
+                    "Unsupported save_path extension. Use .html/.htm for HTML export or an image extension like .png/.jpg/.jpeg/.bmp/.tif/.tiff/.webp."
+                )
         else:
             plotter.show()
 
@@ -385,7 +401,17 @@ class GraphVisualizer:
         debug: bool = False,
     ):
         n_phys = graph.num_physical_nodes
-        self.pv_mesh.point_data["displacement"] = graph.y.numpy()[:n_phys, :3]
+        self.pv_mesh.point_data["displacement"] = (
+            graph.y.detach().cpu().numpy()[:n_phys, :3]
+        )
+
+        scalar_bar_args = {
+            "vertical": True,
+            "position_x": 0.84,
+            "position_y": 0.1,
+            "width": 0.08,
+            "height": 0.8,
+        }
 
         plotter = pv.Plotter(notebook=self.jupyter_backend)
         plotter.add_mesh(
@@ -395,6 +421,7 @@ class GraphVisualizer:
             render_points_as_spheres=True,
             show_edges=True,
             clim=clim,
+            scalar_bar_args=scalar_bar_args,
         )
 
         plotter.show_axes()
@@ -406,7 +433,17 @@ class GraphVisualizer:
     def bottom(self, graph: Data, clim: tuple = None, save_path: str | None = None):
         # First, add von_mises to the full mesh
         n_phys = graph.num_physical_nodes
-        self.pv_mesh.point_data["von_mises"] = graph.y.numpy()[:n_phys, 3]
+        self.pv_mesh.point_data["von_mises"] = (
+            graph.y.detach().cpu().numpy()[:n_phys, 3]
+        )
+
+        scalar_bar_args = {
+            "vertical": True,
+            "position_x": 0.84,
+            "position_y": 0.1,
+            "width": 0.08,
+            "height": 0.8,
+        }
 
         # Then clip the mesh with the data already assigned
         pv_mesh_boundary = self.pv_mesh.clip(normal=(0, 0, 1), origin=(0, 0, 1e-6))
@@ -419,6 +456,7 @@ class GraphVisualizer:
             render_points_as_spheres=True,
             show_edges=True,
             clim=clim,
+            scalar_bar_args=scalar_bar_args,
         )
         plotter.show_axes()
         if save_path is not None:
@@ -429,8 +467,16 @@ class GraphVisualizer:
     def force(self, graph: Data):
         n_phys = graph.num_physical_nodes
         self.pv_mesh.point_data["force_magnitude"] = (
-            graph.x[:n_phys, 3:6].norm(dim=1).numpy()
+            graph.x[:n_phys, 3:6].norm(dim=1).detach().cpu().numpy()
         )
+
+        scalar_bar_args = {
+            "vertical": True,
+            "position_x": 0.84,
+            "position_y": 0.1,
+            "width": 0.08,
+            "height": 0.8,
+        }
 
         plotter = pv.Plotter(notebook=self.jupyter_backend)
         plotter.add_mesh(
@@ -439,6 +485,7 @@ class GraphVisualizer:
             point_size=1,
             render_points_as_spheres=True,
             show_edges=True,
+            scalar_bar_args=scalar_bar_args,
         )
 
         plotter.show_axes()
