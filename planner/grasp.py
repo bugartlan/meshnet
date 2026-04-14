@@ -52,6 +52,7 @@ class Grasp:
                 separator=", ",
             )
         )
+        score_str = "None" if self.score is None else f"{self.score:.3f}"
         return (
             "Grasp(\n"
             f"  pose={self.pose},\n"
@@ -59,6 +60,30 @@ class Grasp:
             f"  c1={self.c1},\n"
             f"  c2={self.c2},\n"
             f"  wrench={wrench_str},\n"
-            f"  score={self.score:.3f}\n"
+            f"  score={score_str}\n"
             ")"
         )
+
+    def _score_value(self) -> float:
+        # Treat missing scores as lowest quality during comparisons.
+        return float("-inf") if self.score is None else float(self.score)
+
+    def __lt__(self, other):
+        if not isinstance(other, Grasp):
+            return NotImplemented
+        return self._score_value() < other._score_value()
+
+    def __le__(self, other):
+        if not isinstance(other, Grasp):
+            return NotImplemented
+        return self._score_value() <= other._score_value()
+
+    def __gt__(self, other):
+        if not isinstance(other, Grasp):
+            return NotImplemented
+        return self._score_value() > other._score_value()
+
+    def __ge__(self, other):
+        if not isinstance(other, Grasp):
+            return NotImplemented
+        return self._score_value() >= other._score_value()

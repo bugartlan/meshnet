@@ -392,6 +392,7 @@ class GraphVisualizer:
                 )
         else:
             plotter.show()
+        return plotter
 
     def displacement(
         self,

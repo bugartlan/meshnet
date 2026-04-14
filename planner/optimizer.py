@@ -3,11 +3,13 @@ from abc import ABC
 import meshio
 import numpy as np
 import torch
-from grasp import Contact, Grasp
-from sampler import GraspSampler
 
 from meshgraphnet.graph_builder import GraphBuilderVirtual
+from meshgraphnet.simulator import Simulator
 from meshgraphnet.utils import msh_to_trimesh
+
+from .grasp import Contact, Grasp
+from .sampler import GraspSampler
 
 
 def skew(v: np.ndarray) -> np.ndarray:
@@ -78,7 +80,7 @@ def sample_wrenches(
     return w
 
 
-def sample_contact_forces(contact: Contact) -> np.ndarray:
+def sample_contact_forces(contact: Contact, fn: float | None = None) -> np.ndarray:
     """Sample a random contact force inside the Coulomb friction cone.
 
     Assumes ``contact.normal`` points outward from the object surface, so the
@@ -102,9 +104,12 @@ def sample_contact_forces(contact: Contact) -> np.ndarray:
         tangent_norm = np.linalg.norm(tangent)
     tangent /= tangent_norm
 
-    ft = np.sqrt(np.random.rand()) * contact.mu
+    if fn is None:
+        fn = np.random.exponential(scale=1.0)
 
-    return -normal + ft * tangent
+    ft = contact.mu * fn
+
+    return -fn * normal + ft * tangent
 
 
 def contact_forces_to_wrench(
@@ -122,8 +127,50 @@ def contact_forces_to_wrench(
 class GraspOptimizer(ABC):
     def __init__(self, gripper):
         self.gripper = gripper
+        self.f_squeeze = 1.0
+        self.torque_scale = 0.1  # relative scaling of forces vs torques
 
     def optimize(self, mesh, mu):
+        raise NotImplementedError
+
+    def get_candidates(
+        self, msh: meshio.Mesh, mu: float, k: int = 20, n_samples: int = 100
+    ):
+        mesh = msh_to_trimesh(msh)
+        pos_com = mesh.center_mass
+
+        sampler = GraspSampler(mesh, self.gripper, mu)
+        grasps = sampler.sample(n_samples=n_samples)
+        if not grasps:
+            print("No valid grasps found!")
+            return None
+
+        candidates = []
+        for grasp in grasps:
+            pos1 = grasp.c1.pos - pos_com
+            pos2 = grasp.c2.pos - pos_com
+
+            count = 0
+            while count < k:
+                delta = np.random.uniform(-self.f_squeeze, self.f_squeeze)
+                f1 = sample_contact_forces(grasp.c1, fn=self.f_squeeze + delta)
+                f2 = sample_contact_forces(grasp.c2, fn=self.f_squeeze - delta)
+                wrench = contact_forces_to_wrench(f1, f2, pos1, pos2)
+                if wrench[2] >= 0:
+                    candidates.append(
+                        Grasp(
+                            pose=grasp.pose,
+                            width=grasp.width,
+                            c1=Contact(grasp.c1.pos, grasp.c1.normal, mu, f1),
+                            c2=Contact(grasp.c2.pos, grasp.c2.normal, mu, f2),
+                            wrench=wrench,
+                        )
+                    )
+                    count += 1
+
+        return candidates
+
+    def rank(self, candidates: list[Grasp]):
         raise NotImplementedError
 
 
@@ -133,30 +180,56 @@ class HeuristicBasedGraspOptimizer(GraspOptimizer):
 
 
 class FEMBasedGraspOptimizer(GraspOptimizer):
-    def __init__(self, gripper):
+    def __init__(self, mesh_filepath: str, gripper):
         super().__init__(gripper)
+        self.mesh = meshio.read(mesh_filepath)
+        self.simulator = Simulator(mesh_filepath, std=0.02)
+        self.epsilon = 1e-4  # small tolerance for bottom stress extraction
 
-    def rank(self, mesh: meshio.Mesh, candidates: list[Grasp]):
-        # Placeholder for FEM-based ranking logic
-        return sorted(candidates, key=lambda g: g.score, reverse=True)
+    def get_candidates(self, mu, k=20, n_samples=100):
+        return super().get_candidates(self.mesh, mu, k, n_samples)
+
+    def rank(self, candidates: list[Grasp]):
+        ranked = []
+        query_points = self.mesh.points[self.mesh.points[:, 2] < self.epsilon]
+        for grasp in candidates:
+            contacts = [
+                (grasp.c1.pos, grasp.c1.force),
+                (grasp.c2.pos, grasp.c2.force),
+            ]
+            uh = self.simulator.run(contacts)
+            vm = self.simulator.compute_vm1(uh)
+            score = np.max(self.simulator.probe(vm, query_points, clip=True))
+            ranked.append(
+                Grasp(
+                    pose=grasp.pose,
+                    width=grasp.width,
+                    c1=grasp.c1,
+                    c2=grasp.c2,
+                    wrench=grasp.wrench,
+                    score=score,
+                )
+            )
+        return sorted(ranked, reverse=True)
 
 
 class GNNBasedGraspOptimizer(GraspOptimizer):
     def __init__(self, gripper, model, normalizer, device="cpu"):
         super().__init__(gripper)
         self.model = model
-        self.normalizer = normalizer
-        self.builder = GraphBuilderVirtual()
         self.device = device
+        self.normalizer = normalizer.to(device)
+        self.builder = GraphBuilderVirtual(std=0.02)
         self.epsilon = 1e-4  # small tolerance for bottom stress extraction
 
-    def optimize(self, msh: meshio.Mesh, mu: float, k: int = 20):
+    def optimize(self, msh: meshio.Mesh, mu: float, k: int = 20, n_samples: int = 100):
         """Sample grasps, build graphs, and predict scores to find the best grasp.
 
         Args:
             msh: Trimesh mesh of the object to grasp.
             mu: Friction coefficient for grasp sampling.
             k: Number of wrenches to sample per grasp.
+            n_samples: Maximum number of antipodal grasps to sample.
         Returns:
             best_grasp: Grasp with the highest predicted score, or None if no valid grasps found.
         """
@@ -166,7 +239,7 @@ class GNNBasedGraspOptimizer(GraspOptimizer):
         y0 = np.zeros((num_nodes, 4))  # dummy node features
 
         sampler = GraspSampler(mesh, self.gripper, mu)
-        grasps = sampler.sample(n_samples=500)
+        grasps = sampler.sample(n_samples=n_samples)
         if not grasps:
             print("No valid grasps found!")
             return None
@@ -180,10 +253,25 @@ class GNNBasedGraspOptimizer(GraspOptimizer):
             best_wrench = None
             best_score = 0.0
 
+            grip = (pos1 - pos2) / grasp.width
+
+            for _ in range(k):
+                f1 = sample_contact_forces(grasp.c1)
+                f2 = sample_contact_forces(grasp.c2)
+                wrench = contact_forces_to_wrench(f1, f2, pos1, pos2)
+                contacts = [
+                    (grasp.c1.pos, f1 - grip / 2),
+                    (grasp.c2.pos, f2 + grip / 2),
+                ]
+                graph = self.builder.build(msh, y0, contacts).to(self.device)
+                y_pred = self.model(self.normalizer.normalize(graph))
+                y_pred = self.normalizer.denormalize_y(y_pred)
+                score = torch.max(y_pred[graph.x[:, 2] < self.epsilon, 3]).item()
+
             wrenches = sample_wrenches(k, force_scale=1.0, torque_scale=0.0)
             for wrench in wrenches:
                 f1, f2 = wrench_to_contact_forces(wrench, pos1, pos2)
-                grip = 0.1 * (pos1 - pos2) / grasp.width
+                grip = 1 * (pos1 - pos2) / grasp.width
                 contacts = [
                     (grasp.c1.pos, f1 - grip / 2),
                     (grasp.c2.pos, f2 + grip / 2),
@@ -196,27 +284,41 @@ class GNNBasedGraspOptimizer(GraspOptimizer):
                     best_score = score
                     best_wrench = wrench
             optimal_grasps.append(
-                (
-                    best_score,
-                    Grasp(
-                        pose=grasp.pose,
-                        width=grasp.width,
-                        c1=grasp.c1,
-                        c2=grasp.c2,
-                        wrench=best_wrench,
-                    ),
-                )
+                Grasp(
+                    pose=grasp.pose,
+                    width=grasp.width,
+                    c1=grasp.c1,
+                    c2=grasp.c2,
+                    wrench=best_wrench,
+                    score=best_score,
+                ),
             )
 
-        return sorted(optimal_grasps, key=lambda x: x[0], reverse=True)
+        return sorted(optimal_grasps, reverse=True)
 
     def rank(self, mesh: meshio.Mesh, candidates: list[Grasp]):
+        ranked = []
         for grasp in candidates:
-            f1 = grasp.c1.force
-            f2 = grasp.c2.force
-            graph = self.normalizer.normalize(
-                self.builder.build(mesh, [(grasp.c1.pos, f1), (grasp.c2.pos, f2)])
+            graph = self.builder.build(
+                mesh,
+                contacts=[
+                    (grasp.c1.pos, grasp.c1.force),
+                    (grasp.c2.pos, grasp.c2.force),
+                ],
             ).to(self.device)
+            graph = self.normalizer.normalize(graph)
             y_pred = self.normalizer.denormalize_y(self.model(graph))
-            grasp.score = torch.max(y_pred[graph.x[:, 2] < self.epsilon, 3]).item()
-        return sorted(candidates, key=lambda g: g.score, reverse=True)
+            score = (
+                torch.max(y_pred[graph.x[:, 2] < self.epsilon, 3]).detach().cpu().item()
+            )
+            ranked.append(
+                Grasp(
+                    pose=grasp.pose,
+                    width=grasp.width,
+                    c1=grasp.c1,
+                    c2=grasp.c2,
+                    wrench=grasp.wrench,
+                    score=score,
+                )
+            )
+        return sorted(ranked, reverse=True)

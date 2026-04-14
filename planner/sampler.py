@@ -1,11 +1,12 @@
 import numpy as np
 import trimesh
-from grasp import Contact, Grasp, Pose
 from scipy.spatial.transform import Rotation as R
+
+from .grasp import Contact, Grasp, Pose
 
 
 class GraspSampler:
-    def __init__(self, mesh, gripper, mu):
+    def __init__(self, mesh: trimesh.Trimesh, gripper, mu: float = 0.1):
         self.mesh = mesh
         self.gripper = gripper
         self.mu = mu

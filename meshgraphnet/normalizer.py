@@ -156,7 +156,9 @@ class Normalizer:
         return batch
 
     def denormalize_y(self, y: torch.Tensor) -> torch.Tensor:
-        return y * self.y_std + self.y_mean
+        y_std = self.y_std.to(device=y.device, dtype=y.dtype)
+        y_mean = self.y_mean.to(device=y.device, dtype=y.dtype)
+        return y * y_std + y_mean
 
     def load(self, stats: dict):
         if stats is None:

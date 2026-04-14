@@ -1,7 +1,11 @@
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import trimesh
+
+_PLANNER_DIR = Path(__file__).resolve().parent
+_ROBOTIQ_STEP_PATH = _PLANNER_DIR / "ROBOTIQ_HAND-E.step"
 
 
 @dataclass(frozen=True)
@@ -39,7 +43,7 @@ class ROBOTIQ_HANDE_GRIPPER:
     max_width: float = 0.05
     base_to_fingertip: float = 0.146  # from base to fingertip
     palm_to_fingertip: float = 0.0455  # from palm to fingertip
-    mesh: trimesh.Trimesh = trimesh.load_mesh("ROBOTIQ_HAND-E.step")
+    mesh: trimesh.Trimesh = trimesh.load_mesh(_ROBOTIQ_STEP_PATH)
 
     box_finger_left: BoxFinger = BoxFinger()
     box_finger_right: BoxFinger = BoxFinger()

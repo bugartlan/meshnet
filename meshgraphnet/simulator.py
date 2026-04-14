@@ -9,7 +9,8 @@ from dolfinx.fem.petsc import apply_lifting, assemble_matrix, assemble_vector, s
 from dolfinx.io import gmshio
 from mpi4py import MPI
 from petsc4py import PETSc
-from utils import msh_to_trimesh
+
+from .utils import msh_to_trimesh
 
 
 class Simulator:
@@ -276,6 +277,7 @@ class Simulator:
         )
         plotter.show_axes()
         plotter.show()
+        return plotter
 
     def plot_vm_bottom(self, vm):
         topology, cell_types, geometry = plot.vtk_mesh(vm.function_space)
