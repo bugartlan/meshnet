@@ -433,20 +433,29 @@ class GraphVisualizer:
         else:
             plotter.show()
 
-    def bottom(self, graph: Data, clim: tuple = None, save_path: str | None = None):
+    def bottom(
+        self,
+        graph: Data,
+        clim: tuple = None,
+        show_axes: bool = False,
+        show_scalar_bar: bool = False,
+        scalar_bar_args: dict | None = None,
+        save_path: str | Path | None = None,
+    ):
         # First, add von_mises to the full mesh
         n_phys = graph.num_physical_nodes
         self.pv_mesh.point_data["von_mises"] = (
             graph.y.detach().cpu().numpy()[:n_phys, 3]
         )
 
-        scalar_bar_args = {
-            "vertical": True,
-            "position_x": 0.84,
-            "position_y": 0.1,
-            "width": 0.08,
-            "height": 0.8,
-        }
+        if scalar_bar_args is None:
+            scalar_bar_args = {
+                "vertical": True,
+                "position_x": 0.84,
+                "position_y": 0.1,
+                "width": 0.08,
+                "height": 0.8,
+            }
 
         # Then clip the mesh with the data already assigned
         pv_mesh_boundary = self.pv_mesh.clip(normal=(0, 0, 1), origin=(0, 0, 1e-6))
@@ -456,18 +465,33 @@ class GraphVisualizer:
             pv_mesh_boundary,
             scalars="von_mises",
             point_size=1,
+            clim=clim,
             render_points_as_spheres=True,
             show_edges=True,
-            clim=clim,
+            show_scalar_bar=show_scalar_bar,
             scalar_bar_args=scalar_bar_args,
         )
-        plotter.show_axes()
-        if save_path is not None:
-            plotter.export_html(save_path)
+
+        if show_axes:
+            plotter.show_axes()
+
+        if save_path:
+            output_path = Path(save_path)
+            suffix = output_path.suffix.lower()
+            output_str = str(output_path)
+
+            if suffix in {".pdf", ".svg", ".eps"}:
+                plotter.save_graphic(output_str)
+            elif suffix in {".html", ".htm"}:
+                plotter.export_html(output_str)
+            else:
+                plotter.screenshot(
+                    output_str, window_size=[2000, 2000], return_img=False
+                )
         else:
             plotter.show()
 
-    def force(self, graph: Data):
+    def force(self, graph: Data, show_force: bool = True):
         n_phys = graph.num_physical_nodes
         self.pv_mesh.point_data["force_magnitude"] = (
             graph.x[:n_phys, 3:6].norm(dim=1).detach().cpu().numpy()
@@ -491,5 +515,13 @@ class GraphVisualizer:
             scalar_bar_args=scalar_bar_args,
         )
 
+        if show_force and hasattr(graph, "contacts") and graph.contacts is not None:
+            for p, f in graph.contacts:
+                arrow = pv.Arrow(
+                    start=np.asarray(p), direction=np.asarray(f), scale=0.01
+                )
+                plotter.add_mesh(arrow, color="red")
+
         plotter.show_axes()
         plotter.show()
+        return plotter

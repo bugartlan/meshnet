@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from scipy.stats import kendalltau
 
-from graph_builder import GraphVisualizer
+from graph_builder import GraphBuilderVirtual, GraphVisualizer
 from nets import EncodeProcessDecode
 from normalizer import LogNormalizer, Normalizer
 from simulator import Simulator
@@ -201,6 +201,7 @@ def evaluate_simulator(
         )
 
     mesh = meshio.read(msh_path)
+
     simulator = Simulator(msh_path, std=0.02)
 
     maes = []
@@ -217,7 +218,7 @@ def evaluate_simulator(
 
         mask = g.x[:, -1] != 1.0
         y_true = g.y[mask, target_index : target_index + 1].to(device)
-        weight = get_weight(g.x[mask, 2], y_true.shape[1], mode="bottom")
+        weight = get_weight(g.x[mask, 2], y_true.shape[1], mode=mode)
 
         mae = F.l1_loss(y_pred, y_true, weight=weight).item()
         pred_np = y_pred.detach().cpu().numpy()
@@ -354,9 +355,9 @@ def plot_sample_predictions(
     stem = Path(msh_path).stem
     suffix = f"{stem}_sample{sample_index}_{mode}"
 
-    gt_path = out_dir / f"{suffix}_ground_truth.html"
-    epd_path = out_dir / f"{suffix}_epd_pred.html"
-    sim_path = out_dir / f"{suffix}_simulator_pred.html"
+    gt_path = out_dir / f"{suffix}_ground_truth.svg"
+    epd_path = out_dir / f"{suffix}_epd_pred.svg"
+    sim_path = out_dir / f"{suffix}_simulator_pred.svg"
 
     if mode == "bottom":
         visualizer.bottom(graph_true, clim=clim, save_path=str(gt_path))

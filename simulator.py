@@ -12,6 +12,14 @@ from petsc4py import PETSc
 
 from utils import msh_to_trimesh
 
+# ------------------- Material Properties -------------------
+E = 2.0e9  # Young's modulus
+nu = 0.35  # Poisson's ratio
+
+# Cohesive stength parameters of the adhesive (Pa)
+sigma_max = 5e6
+tau_max = 3e6
+
 
 class Simulator:
     def __init__(self, filename_msh: str, std: float = 0.001):
@@ -30,9 +38,7 @@ class Simulator:
             self.domain, ("Lagrange", element_order, (self.domain.geometry.dim,))
         )
 
-        # Constants
-        E = 2.0e9  # Young's modulus
-        nu = 0.35  # Poisson's ratio
+        # Lame parameters
         self.lambda_ = E * nu / ((1 + nu) * (1 - 2 * nu))
         self.mu_ = E / (2 * (1 + nu))
 
@@ -115,6 +121,32 @@ class Simulator:
         uh.x.scatter_forward()
 
         return uh
+
+    def get_damage_field(self, uh):
+        """Compute the damage field on the domain."""
+        n = ufl.FacetNormal(self.domain)
+
+        # Calculate traction vector t = sigma * n at the boundary
+        t = ufl.dot(self.sigma(uh), n)
+
+        # Resolve into normal and tangential components
+        t_n = ufl.dot(t, n) * n  # Normal scalar
+        t_t_vec = t - t_n * n  # Tangential vector
+        t_t = ufl.sqrt(ufl.dot(t_t_vec, t_t_vec))  # Tangential magnitude
+
+        # Macaulay bracket for normal traction
+        macualay_tn = ufl.conditional(ufl.gt(t_n, 0), t_n, 0.0)
+
+        # Quadratic nominal stress for cohesive failure
+        nominal_stress = (macualay_tn / sigma_max) ** 2 + (t_t / tau_max) ** 2
+        W = fem.functionspace(self.domain, ("Lagrange", 1))
+        nominal_stress_expr = fem.Expression(
+            nominal_stress, W.element.interpolation_points()
+        )
+        damage_field = fem.Function(W)
+        damage_field.interpolate(nominal_stress_expr)
+
+        return damage_field
 
     def compute_vm0(self, uh):
         V = fem.functionspace(self.domain, ("DG", 0))
@@ -246,50 +278,57 @@ class Simulator:
 
         return values
 
-    def plot_displacement(self, uh):
-        topology, cell_types, geometry = plot.vtk_mesh(uh.function_space)
-        grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
-        grid.point_data["displacement"] = uh.x.array.real.reshape(-1, 3)
+    # ------------------- Visualization -------------------
+
+    def _build_grid(self, function_space):
+        topology, cell_types, geometry = plot.vtk_mesh(function_space)
+        return pyvista.UnstructuredGrid(topology, cell_types, geometry)
+
+    def _render_grid(
+        self,
+        grid: pyvista.UnstructuredGrid,
+        scalar_name: str,
+        scalar_bar_title: str,
+        slice_bottom: bool = False,
+    ) -> None:
+        target = grid
+        if slice_bottom:
+            target = grid.slice(normal="z", origin=(0, 0, 1e-6))
 
         plotter = pyvista.Plotter()
         plotter.add_mesh(
-            grid,
-            scalars="displacement",
+            target,
+            scalars=scalar_name,
             show_edges=True,
-            scalar_bar_args={"title": "Displacement (m)"},
+            scalar_bar_args={"title": scalar_bar_title},
         )
         plotter.show_axes()
         plotter.show()
+
+    def plot_displacement(self, uh):
+        grid = self._build_grid(uh.function_space)
+        grid.point_data["displacement"] = uh.x.array.real.reshape(-1, 3)
+        self._render_grid(
+            grid,
+            scalar_name="displacement",
+            scalar_bar_title="Displacement (m)",
+        )
 
     def plot_vm(self, vm):
-        topology, cell_types, geometry = plot.vtk_mesh(vm.function_space)
-        grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
+        grid = self._build_grid(vm.function_space)
         grid.point_data["vm"] = vm.x.array.real
-
-        plotter = pyvista.Plotter()
-        plotter.add_mesh(
+        self._render_grid(
             grid,
-            scalars="vm",
-            show_edges=True,
-            scalar_bar_args={"title": "Von Mises Stress (Pa)"},
+            scalar_name="vm",
+            scalar_bar_title="Von Mises Stress (Pa)",
         )
-        plotter.show_axes()
-        plotter.show()
 
     def plot_vm_bottom(self, vm):
-        topology, cell_types, geometry = plot.vtk_mesh(vm.function_space)
-        grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
+        grid = self._build_grid(vm.function_space)
         grid.point_data["vm"] = vm.x.array.real
-
-        slice_z = 1e-6
-        sliced = grid.slice(normal="z", origin=(0, 0, slice_z))
-
-        plotter = pyvista.Plotter()
-        plotter.add_mesh(
-            sliced,
-            scalars="vm",
-            show_edges=True,
-            scalar_bar_args={"title": "Von Mises Stress (Pa)"},
+        self._render_grid(
+            grid,
+            scalar_name="vm",
+            scalar_bar_title="Von Mises Stress (Pa)",
+            slice_bottom=True,
         )
-        plotter.show_axes()
-        plotter.show()

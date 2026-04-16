@@ -7,6 +7,7 @@ import gmsh
 import meshio
 import numpy as np
 import torch
+from torch_geometric.loader import DataLoader
 
 from graph_builder import GraphBuilderVirtual
 from nets import EncodeProcessDecode
@@ -14,17 +15,15 @@ from normalizer import LogNormalizer, Normalizer
 from simulator import Simulator
 from utils import get_weight
 
-DATA_FILE = "data/T-Bracket2_100.pt"
-CHECKPOINT_FILE = "models/Train_all_w.pth"
+DATA_FILE = "data/Bushing2_100.pt"
+CHECKPOINT_FILE = "models/Model0.pth"
 TARGET_INDEX = 3
 
 
 @dataclass
 class SpeedSummary:
+    total_s: float
     mean_s: float
-    std_s: float
-    min_s: float
-    max_s: float
     runs: int
 
 
@@ -39,12 +38,6 @@ def parse_args():
         type=int,
         default=0,
         help="Sample index in the dataset to benchmark.",
-    )
-    p.add_argument(
-        "--warmup",
-        type=int,
-        default=5,
-        help="Warmup iterations not included in timing stats.",
     )
     p.add_argument(
         "--runs",
@@ -85,7 +78,7 @@ def prepare_graphs(graphs, normalizer, mode):
 
     for graph in graphs:
         graph_norm = normalizer.normalize(graph)
-        weight = get_weight(graph.x[:, 2], 1, mode=mode)
+        weight = get_weight(graph.x[:, 2], 4, mode=mode)
 
         # Only weight physical nodes, not virtual nodes.
         physical = (graph.x[:, -1] != 1.0).unsqueeze(1).float()
@@ -102,17 +95,13 @@ def aggregate(values: list[float]) -> SpeedSummary:
     arr = np.asarray(values, dtype=np.float64)
     if arr.size == 0:
         return SpeedSummary(
+            total_s=float("nan"),
             mean_s=float("nan"),
-            std_s=float("nan"),
-            min_s=float("nan"),
-            max_s=float("nan"),
             runs=0,
         )
     return SpeedSummary(
+        total_s=float(np.sum(arr)),
         mean_s=float(np.mean(arr)),
-        std_s=float(np.std(arr)),
-        min_s=float(np.min(arr)),
-        max_s=float(np.max(arr)),
         runs=int(arr.size),
     )
 
@@ -125,78 +114,70 @@ def benchmark_encode_process_decode(
     mode: str,
     device: torch.device,
     builder,
-    warmup: int,
     runs: int,
 ):
-    times = []
+    start = perf_counter()
 
-    # Graph construction is included in this benchmark by rebuilding from mesh + contacts each run.
-    for i in range(warmup + runs):
-        start = perf_counter()
+    graphs = [
+        builder.build(mesh, contacts=sample.contacts).to(device) for _ in range(runs)
+    ]
+    graphs_norm = [normalizer.normalize(g) for g in graphs]
+    loader = DataLoader(graphs_norm, batch_size=4, shuffle=False)
 
-        y_phys = sample.y[: sample.num_physical_nodes].detach().cpu().numpy()
-        rebuilt = builder.build(mesh, y_phys, contacts=sample.contacts)
-        g = rebuilt.to(device)
+    with torch.no_grad():
+        for batch in loader:
+            normalizer.denormalize_y(model(batch))
 
-        g_norm = normalizer.normalize(g)
-        weight = get_weight(g.x[:, 2], 1, mode=mode)
-        weight = weight * (g.x[:, -1] != 1.0).unsqueeze(1).float()
-        g_norm.weight = weight
+    elapsed = perf_counter() - start
 
-        with torch.no_grad():
-            _ = normalizer.denormalize_y(model(g_norm))
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-
-        elapsed = perf_counter() - start
-        if i >= warmup:
-            times.append(elapsed)
-
-    return aggregate(times)
+    return SpeedSummary(
+        total_s=elapsed,
+        mean_s=elapsed / runs,
+        runs=runs,
+    )
 
 
-def benchmark_simulator(
-    sample,
-    msh_path: Path,
-    sigma: float,
-    warmup: int,
-    runs: int,
-):
-    times = []
+def benchmark_simulator(sample, msh_path: Path, sigma: float, runs: int):
+    start = perf_counter()
     mesh = meshio.read(msh_path)
 
-    for i in range(warmup + runs):
-        start = perf_counter()
+    for i in range(runs):
         simulator = Simulator(str(msh_path), std=sigma)
 
         uh = simulator.run(sample.contacts)
         vm = simulator.compute_vm1(uh)
         _ = simulator.probe(vm, mesh.points)
 
-        elapsed = perf_counter() - start
-        if i >= warmup:
-            times.append(elapsed)
+    elapsed = perf_counter() - start
 
-    return aggregate(times)
+    return SpeedSummary(
+        total_s=elapsed,
+        mean_s=elapsed / runs,
+        runs=runs,
+    )
 
 
-def print_comparison(epd: SpeedSummary, sim: SpeedSummary):
+def print_comparison(epd: SpeedSummary, sim1: SpeedSummary, sim2: SpeedSummary):
     print("\nSingle-sample speed comparison")
-    print("-" * 84)
+    print("-" * 56)
+    print(f"{'Method':<22}{'Total (s)':>12}{'Mean (s)':>12}{'Runs':>10}")
+    print("-" * 56)
     print(
-        f"{'Method':<22}{'Mean (s)':>12}{'Std (s)':>12}{'Min (s)':>12}{'Max (s)':>12}{'Runs':>8}"
-    )
-    print("-" * 84)
-    print(
-        f"{'EncodeProcessDecode':<22}{epd.mean_s:>12.6f}{epd.std_s:>12.6f}{epd.min_s:>12.6f}{epd.max_s:>12.6f}{epd.runs:>8}"
+        f"{'EncodeProcessDecode':<22}{epd.total_s:>12.6f}{epd.mean_s:>12.6f}{epd.runs:>10}"
     )
     print(
-        f"{'Simulator':<22}{sim.mean_s:>12.6f}{sim.std_s:>12.6f}{sim.min_s:>12.6f}{sim.max_s:>12.6f}{sim.runs:>8}"
+        f"{'Simulator (Coarse)':<22}{sim1.total_s:>12.6f}{sim1.mean_s:>12.6f}{sim1.runs:>10}"
     )
-    print("-" * 84)
+    print(
+        f"{'Simulator (Fine)':<22}{sim2.total_s:>12.6f}{sim2.mean_s:>12.6f}{sim2.runs:>10}"
+    )
+    print("-" * 56)
 
-    speedup = sim.mean_s / epd.mean_s if epd.mean_s > 0 else float("nan")
-    print(f"EncodeProcessDecode speedup over Simulator: {speedup:.2f}x")
+    speedup = sim1.mean_s / epd.mean_s if epd.mean_s > 0 else float("nan")
+    print(f"EncodeProcessDecode speedup over Simulator (Coarse): {speedup:.2f}x")
+
+    speedup = sim2.mean_s / epd.mean_s if epd.mean_s > 0 else float("nan")
+    print(f"EncodeProcessDecode speedup over Simulator (Fine): {speedup:.2f}x")
 
 
 def main():
@@ -236,9 +217,7 @@ def main():
 
     print(f"Loaded dataset: {args.data_file} ({len(graphs)} samples)")
     print(f"Using sample-index={args.sample_index}, mesh={msh_path.name}")
-    print(
-        f"Device={device}, warmup={args.warmup}, runs={args.runs}, sigma={args.sigma}"
-    )
+    print(f"Device={device}, runs={args.runs}, sigma={args.sigma}")
     print(f"Graph builder: {builder.__class__.__name__}")
 
     print("\nBenchmarking EncodeProcessDecode (including graph construction)...")
@@ -250,20 +229,29 @@ def main():
         mode=args.mode,
         device=device,
         builder=builder,
-        warmup=args.warmup,
         runs=args.runs,
     )
 
     print("Benchmarking Simulator...")
-    sim_speed = benchmark_simulator(
+    sim_speed_coarse = benchmark_simulator(
         sample=sample,
         msh_path=msh_path,
         sigma=args.sigma,
-        warmup=args.warmup,
         runs=args.runs,
     )
 
-    print_comparison(epd_speed, sim_speed)
+    print("Benchmarking Simulator with finer mesh...")
+    msh_path_fine = msh_path.with_name(
+        msh_path.stem.replace("cg1", "cg2") + msh_path.suffix
+    )
+    sim_speed_fine = benchmark_simulator(
+        sample=sample,
+        msh_path=msh_path_fine,
+        sigma=args.sigma,
+        runs=args.runs,
+    )
+
+    print_comparison(epd_speed, sim_speed_coarse, sim_speed_fine)
 
 
 if __name__ == "__main__":
