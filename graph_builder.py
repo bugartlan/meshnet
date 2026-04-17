@@ -334,14 +334,126 @@ class GraphBuilderVirtual(GraphBuilderBase):
 
 
 class GraphVisualizer:
+    _HTML_SUFFIXES = {".html", ".htm"}
+    _IMAGE_SUFFIXES = {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".bmp",
+        ".tif",
+        ".tiff",
+        ".webp",
+    }
+    _VECTOR_SUFFIXES = {".pdf", ".svg", ".eps"}
+
     def __init__(self, mesh: trimesh.Trimesh, jupyter_backend: bool = True):
         self.mesh = mesh
         self.pv_mesh = pv.wrap(mesh)
         self.jupyter_backend = jupyter_backend
 
+    @staticmethod
+    def _default_scalar_bar_args() -> dict:
+        return {
+            "vertical": True,
+            "position_x": 0.84,
+            "position_y": 0.1,
+            "width": 0.08,
+            "height": 0.8,
+        }
+
+    def _new_plotter(self) -> pv.Plotter:
+        return pv.Plotter(notebook=self.jupyter_backend)
+
+    @staticmethod
+    def _graph_contacts(graph: Data) -> list[tuple[np.ndarray, np.ndarray]]:
+        contacts = getattr(graph, "contacts", None)
+        if contacts is None:
+            return []
+        return list(contacts)
+
+    def _mesh_scale(self, ratio: float = 0.1) -> float:
+        x_min, x_max, y_min, y_max, z_min, z_max = self.pv_mesh.bounds
+        return max(x_max - x_min, y_max - y_min, z_max - z_min) * ratio
+
+    def _add_contact_vectors(
+        self,
+        plotter: pv.Plotter,
+        contacts: list[tuple[np.ndarray, np.ndarray]],
+        arrow_scale: float,
+        sphere_radius: float | None = None,
+        debug: bool = False,
+    ) -> None:
+        for point, force in contacts:
+            if debug:
+                print(f"Contact point: {point}, Force: {force}")
+
+            if sphere_radius is not None:
+                sphere = pv.Sphere(radius=sphere_radius)
+                sph = sphere.translate(point, inplace=False)
+                plotter.add_mesh(sph, color="red", opacity=1)
+
+            arrow = pv.Arrow(
+                start=np.asarray(point), direction=np.asarray(force), scale=arrow_scale
+            )
+            plotter.add_mesh(arrow, color="red")
+
+    def _save_stress_plot(
+        self,
+        plotter: pv.Plotter,
+        save_path: str | Path | None,
+    ) -> None:
+        if save_path is None:
+            plotter.show()
+            return
+
+        output_path = Path(save_path)
+        suffix = output_path.suffix.lower()
+        output_str = str(output_path)
+
+        if suffix in self._HTML_SUFFIXES:
+            plotter.export_html(output_str)
+        elif suffix in self._IMAGE_SUFFIXES:
+            plotter.window_size = (1600, 1000)
+            plotter.show(screenshot=output_str)
+        else:
+            raise ValueError(
+                "Unsupported save_path extension. Use .html/.htm for HTML export or an image extension like .png/.jpg/.jpeg/.bmp/.tif/.tiff/.webp."
+            )
+
+    def _save_bottom_plot(
+        self,
+        plotter: pv.Plotter,
+        save_path: str | Path | None,
+    ) -> None:
+        if not save_path:
+            plotter.show()
+            return
+
+        output_path = Path(save_path)
+        suffix = output_path.suffix.lower()
+        output_str = str(output_path)
+
+        if suffix in self._VECTOR_SUFFIXES:
+            plotter.save_graphic(output_str)
+        elif suffix in self._HTML_SUFFIXES:
+            plotter.export_html(output_str)
+        else:
+            plotter.screenshot(output_str, window_size=[2000, 2000], return_img=False)
+
+    @staticmethod
+    def _save_html_or_show(
+        plotter: pv.Plotter,
+        save_path: str | Path | None,
+    ) -> None:
+        if save_path is not None:
+            plotter.export_html(str(save_path))
+        else:
+            plotter.show()
+
     def stress(
         self,
         graph: Data,
+        cmap: str = "Oranges",
         clim: tuple = None,
         show_contacts: bool = True,
         save_path: str | None = None,
@@ -353,7 +465,7 @@ class GraphVisualizer:
             graph.y.detach().cpu().numpy()[:n_phys, 3]
         )
 
-        plotter = pv.Plotter(notebook=self.jupyter_backend)
+        plotter = self._new_plotter()
         plotter.add_mesh(
             self.pv_mesh,
             scalars="von_mises",
@@ -362,45 +474,29 @@ class GraphVisualizer:
             show_edges=True,
             clim=clim,
             scalar_bar_args=scalar_bar_args,
+            cmap=cmap,
         )
 
-        x_min, x_max, y_min, y_max, z_min, z_max = self.pv_mesh.bounds
-        scale = max(x_max - x_min, y_max - y_min, z_max - z_min) * 0.1
-
-        if show_contacts and hasattr(graph, "contacts") and graph.contacts is not None:
-            for p, f in graph.contacts:
-                if debug:
-                    print(f"Contact point: {p}, Force: {f}")
-
-                sphere = pv.Sphere(radius=scale * 0.1)
-                sph = sphere.translate(p, inplace=False)
-                plotter.add_mesh(sph, color="red", opacity=1)
-
-                arrow = pv.Arrow(
-                    start=np.asarray(p), direction=np.asarray(f), scale=scale
-                )
-                plotter.add_mesh(arrow, color="red")
+        contacts = self._graph_contacts(graph)
+        if show_contacts and len(contacts) > 0:
+            scale = self._mesh_scale(ratio=0.1)
+            self._add_contact_vectors(
+                plotter,
+                contacts=contacts,
+                arrow_scale=scale,
+                sphere_radius=scale * 0.1,
+                debug=debug,
+            )
 
         plotter.show_axes()
-        if save_path is not None:
-            suffix = Path(save_path).suffix.lower()
-            if suffix in {".html", ".htm"}:
-                plotter.export_html(save_path)
-            elif suffix in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}:
-                plotter.window_size = (1600, 1000)
-                plotter.show(screenshot=save_path)
-            else:
-                raise ValueError(
-                    "Unsupported save_path extension. Use .html/.htm for HTML export or an image extension like .png/.jpg/.jpeg/.bmp/.tif/.tiff/.webp."
-                )
-        else:
-            plotter.show()
+        self._save_stress_plot(plotter, save_path=save_path)
 
     def displacement(
         self,
         graph: Data,
+        cmap: str = "Oranges",
         clim: tuple = None,
-        save_path: str | None = None,
+        save_path: str | Path | None = None,
         debug: bool = False,
     ):
         n_phys = graph.num_physical_nodes
@@ -408,15 +504,10 @@ class GraphVisualizer:
             graph.y.detach().cpu().numpy()[:n_phys, :3]
         )
 
-        scalar_bar_args = {
-            "vertical": True,
-            "position_x": 0.84,
-            "position_y": 0.1,
-            "width": 0.08,
-            "height": 0.8,
-        }
+        _ = debug
+        scalar_bar_args = self._default_scalar_bar_args()
 
-        plotter = pv.Plotter(notebook=self.jupyter_backend)
+        plotter = self._new_plotter()
         plotter.add_mesh(
             self.pv_mesh,
             scalars="displacement",
@@ -425,17 +516,16 @@ class GraphVisualizer:
             show_edges=True,
             clim=clim,
             scalar_bar_args=scalar_bar_args,
+            cmap=cmap,
         )
 
         plotter.show_axes()
-        if save_path is not None:
-            plotter.export_html(save_path)
-        else:
-            plotter.show()
+        self._save_html_or_show(plotter, save_path=save_path)
 
     def bottom(
         self,
         graph: Data,
+        cmap: str = "Oranges",
         clim: tuple = None,
         show_axes: bool = False,
         show_scalar_bar: bool = False,
@@ -449,78 +539,56 @@ class GraphVisualizer:
         )
 
         if scalar_bar_args is None:
-            scalar_bar_args = {
-                "vertical": True,
-                "position_x": 0.84,
-                "position_y": 0.1,
-                "width": 0.08,
-                "height": 0.8,
-            }
+            scalar_bar_args = self._default_scalar_bar_args()
 
         # Then clip the mesh with the data already assigned
         pv_mesh_boundary = self.pv_mesh.clip(normal=(0, 0, 1), origin=(0, 0, 1e-6))
 
-        plotter = pv.Plotter(notebook=self.jupyter_backend)
+        plotter = self._new_plotter()
         plotter.add_mesh(
             pv_mesh_boundary,
             scalars="von_mises",
             point_size=1,
+            cmap=cmap,
             clim=clim,
             render_points_as_spheres=True,
             show_edges=True,
             show_scalar_bar=show_scalar_bar,
             scalar_bar_args=scalar_bar_args,
         )
+        plotter.camera.tight(padding=0.0)
 
         if show_axes:
             plotter.show_axes()
 
-        if save_path:
-            output_path = Path(save_path)
-            suffix = output_path.suffix.lower()
-            output_str = str(output_path)
+        self._save_bottom_plot(plotter, save_path=save_path)
 
-            if suffix in {".pdf", ".svg", ".eps"}:
-                plotter.save_graphic(output_str)
-            elif suffix in {".html", ".htm"}:
-                plotter.export_html(output_str)
-            else:
-                plotter.screenshot(
-                    output_str, window_size=[2000, 2000], return_img=False
-                )
-        else:
-            plotter.show()
-
-    def force(self, graph: Data, show_force: bool = True):
+    def force(self, graph: Data, cmap: str = "Oranges", show_force: bool = True):
         n_phys = graph.num_physical_nodes
         self.pv_mesh.point_data["force_magnitude"] = (
             graph.x[:n_phys, 3:6].norm(dim=1).detach().cpu().numpy()
         )
 
-        scalar_bar_args = {
-            "vertical": True,
-            "position_x": 0.84,
-            "position_y": 0.1,
-            "width": 0.08,
-            "height": 0.8,
-        }
+        scalar_bar_args = self._default_scalar_bar_args()
 
-        plotter = pv.Plotter(notebook=self.jupyter_backend)
+        plotter = self._new_plotter()
         plotter.add_mesh(
             self.pv_mesh,
             scalars="force_magnitude",
+            cmap=cmap,
             point_size=1,
             render_points_as_spheres=True,
             show_edges=True,
             scalar_bar_args=scalar_bar_args,
         )
 
-        if show_force and hasattr(graph, "contacts") and graph.contacts is not None:
-            for p, f in graph.contacts:
-                arrow = pv.Arrow(
-                    start=np.asarray(p), direction=np.asarray(f), scale=0.01
-                )
-                plotter.add_mesh(arrow, color="red")
+        contacts = self._graph_contacts(graph)
+        if show_force and len(contacts) > 0:
+            self._add_contact_vectors(
+                plotter,
+                contacts=contacts,
+                arrow_scale=0.01,
+            )
 
         plotter.show_axes()
         plotter.show()

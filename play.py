@@ -113,6 +113,39 @@ def compute_kendall_tau(
 # ---------------------------------------------------------------------------
 
 
+def _build_stress_error_graph(g_true, g_pred, n_phys: int):
+    """Create a graph whose stress channel stores absolute prediction error."""
+    g_err = g_true.clone()
+    g_err.y = g_true.y.clone()
+    g_err.y[:n_phys, 3] = (g_pred.y[:n_phys, 3] - g_true.y[:n_phys, 3]).abs()
+    return g_err
+
+
+def _stress_values(graph, n_phys: int, mode: str) -> torch.Tensor:
+    """Extract stress values used for shared color scaling."""
+    stress = graph.y[:n_phys, 3]
+    if mode != "bottom":
+        return stress
+
+    z = graph.x[:n_phys, 2]
+    bottom_mask = torch.isclose(z, torch.zeros_like(z), atol=1e-6)
+    # Fallback to all physical nodes when a strict bottom slice is empty.
+    if not torch.any(bottom_mask):
+        return stress
+    return stress[bottom_mask]
+
+
+def _stress_clim(g_true, g_pred, n_phys: int, mode: str) -> tuple[float, float]:
+    """Compute color limits shared by true and predicted stress fields."""
+    vals = torch.cat(
+        [
+            _stress_values(g_true, n_phys=n_phys, mode=mode),
+            _stress_values(g_pred, n_phys=n_phys, mode=mode),
+        ]
+    )
+    return (vals.min().item(), vals.max().item())
+
+
 def plot(g_true, g_pred, visualizer: GraphVisualizer, mode: str, paths: PlotPaths):
     """Render and save ground-truth, prediction, and absolute-error plots.
 
@@ -123,36 +156,20 @@ def plot(g_true, g_pred, visualizer: GraphVisualizer, mode: str, paths: PlotPath
         mode: ``"bottom"`` to render the bottom surface only, else full mesh.
         paths: Output file paths for the three plot files.
     """
+    if mode not in {"bottom", "all"}:
+        raise ValueError(f"Unsupported mode: {mode!r}. Expected 'bottom' or 'all'.")
+
     n_phys = g_true.num_physical_nodes
+    g_err = _build_stress_error_graph(g_true, g_pred, n_phys=n_phys)
+    clim = _stress_clim(g_true, g_pred, n_phys=n_phys, mode=mode)
+    render = visualizer.bottom if mode == "bottom" else visualizer.stress
 
-    # Create error graph for von Mises stress visualization
-    g_err = g_true.clone()
-    g_err.y = g_true.y.clone()
-    g_err.y[:n_phys, 3] = (g_pred.y[:n_phys, 3] - g_true.y[:n_phys, 3]).abs()
-
-    if mode == "bottom":
-        bottom_mask = torch.isclose(
-            g_true.x[:n_phys, 2],
-            torch.zeros_like(g_true.x[:n_phys, 2]),
-            atol=1e-6,
-        )
-        true_vals = g_true.y[:n_phys, 3][bottom_mask]
-        pred_vals = g_pred.y[:n_phys, 3][bottom_mask]
-        clim = (
-            torch.min(torch.cat([true_vals, pred_vals])).item(),
-            torch.max(torch.cat([true_vals, pred_vals])).item(),
-        )
-        visualizer.bottom(g_true, clim=clim, save_path=paths.true)
-        visualizer.bottom(g_pred, clim=clim, save_path=paths.pred)
-        visualizer.bottom(g_err, clim=clim, save_path=paths.error)
-    else:
-        clim = (
-            torch.min(torch.cat([g_true.y[:n_phys, 3], g_pred.y[:n_phys, 3]])).item(),
-            torch.max(torch.cat([g_true.y[:n_phys, 3], g_pred.y[:n_phys, 3]])).item(),
-        )
-        visualizer.stress(g_true, clim=clim, save_path=paths.true)
-        visualizer.stress(g_pred, clim=clim, save_path=paths.pred)
-        visualizer.stress(g_err, clim=clim, save_path=paths.error)
+    for graph, out_path in (
+        (g_true, paths.true),
+        (g_pred, paths.pred),
+        (g_err, paths.error),
+    ):
+        render(graph, clim=clim, save_path=out_path)
 
 
 # ---------------------------------------------------------------------------
