@@ -8,8 +8,8 @@ meshes
 .DS_Store
 runs
 images
-figures.ipynb
 *.png
 *.jpg
 *.svg
 *.pdf
+notebooks
