@@ -9,11 +9,11 @@ import numpy as np
 import torch
 from torch_geometric.loader import DataLoader
 
-from graph_builder import GraphBuilderVirtual
-from nets import EncodeProcessDecode
-from normalizer import LogNormalizer, Normalizer
-from simulator import Simulator
-from utils import get_weight
+from meshnet.mgn.graphs import GraphBuilderVirtual
+from src.meshnet.mgn.nets import EncodeProcessDecode
+from src.meshnet.mgn.normalizer import LogNormalizer, Normalizer
+from src.meshnet.mgn.simulator import Simulator
+from src.meshnet.utils import get_weight
 
 DATA_FILE = "data/Bushing2_100.pt"
 CHECKPOINT_FILE = "models/Model0.pth"

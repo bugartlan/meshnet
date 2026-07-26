@@ -9,6 +9,7 @@ dependencies:
   - jupyterlab
   - notebook
   - ipywidgets
+  - potpourri3d
   - scipy
   - fenics-dolfinx=0.9.0
   - pyvista

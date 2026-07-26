@@ -2,10 +2,13 @@ from pathlib import Path
 
 import meshio
 import numpy as np
+import numpy.typing as npt
 import pyvista as pv
 import torch
 import trimesh
 from torch_geometric.data import Data
+
+from meshnet.mgn.geodesics import SurfaceGeodesics
 
 
 class GraphBuilderBase:
@@ -25,14 +28,19 @@ class GraphBuilderBase:
     """
 
     def __init__(self, std: float = 0.001):
+        if std <= 0:
+            raise ValueError(f"std must be positive, got {std}")
+
         self.std = std
         self.boundary_tol = 1e-6
         self.num_categorical = 1  # For boundary flags
+        self._geodesic_mesh: meshio.Mesh | None = None
+        self._surface_geodesics: SurfaceGeodesics | None = None
 
     def build(
         self,
         mesh: meshio.Mesh,
-        y: np.ndarray,
+        y: npt.ArrayLike,
         contacts: list[tuple] | None = None,
     ) -> Data:
         if y.shape[0] != mesh.points.shape[0]:
@@ -56,26 +64,56 @@ class GraphBuilderBase:
             contacts=contacts,
         )
 
-    def gaussian_loads(self, coords: np.ndarray, contacts: list[tuple]) -> torch.Tensor:
+    def gaussian_loads(
+        self,
+        mesh: meshio.Mesh,
+        contacts: list[tuple],
+    ) -> torch.Tensor:
+        """Distribute contact forces over the surface using geodesic Gaussians."""
+        coords = np.asarray(mesh.points, dtype=np.float64)
         n = coords.shape[0]
         if not contacts:
             return torch.zeros((n, 3), dtype=torch.float32)
 
-        pts = np.asarray([p for p, _ in contacts])  # (k, 3)
-        frc = np.asarray([f for _, f in contacts])  # (k, 3)
+        geodesics = self._get_surface_geodesics(mesh)
 
-        d = coords[:, None, :] - pts[None, :, :]
-        dist_sq = np.einsum("nkd,nkd->nk", d, d)
-        w = np.exp(-dist_sq / (2 * self.std**2))
+        frc = np.asarray([f for _, f in contacts], dtype=np.float64)
+        if frc.shape != (len(contacts), 3) or not np.all(np.isfinite(frc)):
+            raise ValueError("Contact forces must be finite 3D vectors")
+
+        w = np.zeros((n, len(contacts)), dtype=np.float64)
+        for contact_index, (point, _) in enumerate(contacts):
+            distances = geodesics.distance_from(point)
+            w[geodesics.vertex_indices, contact_index] = np.exp(
+                -(distances**2) / (2 * self.std**2)
+            )
+
         w_sum = w.sum(axis=0, keepdims=True)
-        w /= np.where(w_sum > 0, w_sum, 1.0)
+        if not np.all(np.isfinite(w_sum)) or np.any(
+            w_sum <= np.finfo(np.float64).tiny
+        ):
+            raise ValueError(
+                "Contact kernel normalization failed; std may be too small "
+                "for the surface mesh"
+            )
+        w /= w_sum
 
         return torch.from_numpy((w @ frc).astype(np.float32, copy=False))
+
+    def _get_surface_geodesics(self, mesh: meshio.Mesh) -> SurfaceGeodesics:
+        """Return the cached solver for ``mesh``, rebuilding on identity change."""
+        if self._geodesic_mesh is not mesh or self._surface_geodesics is None:
+            self._geodesic_mesh = mesh
+            self._surface_geodesics = SurfaceGeodesics.from_mesh(
+                mesh,
+                tolerance=self.boundary_tol,
+            )
+        return self._surface_geodesics
 
     def _make_nodes(
         self,
         mesh: meshio.Mesh,
-        loads: list[tuple[np.ndarray, np.ndarray]],
+        loads: list[tuple[npt.ArrayLike, npt.ArrayLike]],
     ) -> torch.Tensor:
         vertices = mesh.points.astype(np.float32, copy=False)
 
@@ -83,7 +121,7 @@ class GraphBuilderBase:
         coords = torch.from_numpy(vertices)
 
         # Force Vectors
-        forces = self.gaussian_loads(vertices, loads)
+        forces = self.gaussian_loads(mesh, loads)
 
         # Boundary Mask
         mask_np = np.isclose(vertices[:, 2], 0.0, atol=self.boundary_tol).astype(
@@ -194,7 +232,7 @@ class GraphBuilderAugment(GraphBuilderBase):
             attrs = torch.zeros((num_nodes, 0), dtype=torch.float32)
 
         # Force Vectors
-        forces = self.gaussian_loads(vertices, loads)
+        forces = self.gaussian_loads(mesh, loads)
 
         # Boundary Mask
         mask = torch.zeros((num_nodes, 1), dtype=torch.float32)
@@ -276,7 +314,7 @@ class GraphBuilderVirtual(GraphBuilderBase):
         coords = torch.tensor(vertices, dtype=torch.float32)
 
         # Force Vectors
-        forces = self.gaussian_loads(vertices, loads)
+        forces = self.gaussian_loads(mesh, loads)
 
         # Boundary Mask
         mask = torch.zeros((num_nodes, 1), dtype=torch.float32)
@@ -330,19 +368,20 @@ class GraphBuilderVirtual(GraphBuilderBase):
         return edge_index, edge_attr
 
 
-class GraphVisualizer:
-    _HTML_SUFFIXES = {".html", ".htm"}
-    _IMAGE_SUFFIXES = {
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".bmp",
-        ".tif",
-        ".tiff",
-        ".webp",
-    }
-    _VECTOR_SUFFIXES = {".pdf", ".svg", ".eps"}
+_HTML_SUFFIXES = {".html", ".htm"}
+_IMAGE_SUFFIXES = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
+_VECTOR_SUFFIXES = {".pdf", ".svg", ".eps"}
 
+
+class GraphVisualizer:
     def __init__(self, mesh: trimesh.Trimesh, jupyter_backend: bool = True):
         self.mesh = mesh
         self.pv_mesh = pv.wrap(mesh)
@@ -451,7 +490,7 @@ class GraphVisualizer:
         self,
         graph: Data,
         cmap: str = "Oranges",
-        clim: tuple = None,
+        clim: tuple | None = None,
         show_contacts: bool = True,
         save_path: str | None = None,
         debug: bool = False,
@@ -505,7 +544,7 @@ class GraphVisualizer:
         self,
         graph: Data,
         cmap: str = "Oranges",
-        clim: tuple = None,
+        clim: tuple | None = None,
         save_path: str | Path | None = None,
         debug: bool = False,
     ):
@@ -536,7 +575,7 @@ class GraphVisualizer:
         self,
         graph: Data,
         cmap: str = "Oranges",
-        clim: tuple = None,
+        clim: tuple | None = None,
         show_axes: bool = False,
         show_scalar_bar: bool = False,
         scalar_bar_args: dict | None = None,

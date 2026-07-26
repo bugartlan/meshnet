@@ -16,8 +16,8 @@ from physicsnemo.models.meshgraphnet import (
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
-from normalizer import LogNormalizer, Normalizer
-from utils import get_weight
+from src.meshnet.mgn.normalizer import LogNormalizer, Normalizer
+from src.meshnet.utils import get_weight
 
 warnings.filterwarnings("ignore")
 

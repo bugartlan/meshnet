@@ -12,4 +12,5 @@ images
 *.jpg
 *.svg
 *.pdf
-notebooks
+notebooks/
+resources/

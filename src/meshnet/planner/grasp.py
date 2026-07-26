@@ -17,8 +17,15 @@ class Pose:
         se3[:3, 3] = self.pos
         return se3
 
-    def __str__(self):
-        return f"Pose(pos={self.pos}, quat={self.quat})"
+    def __repr__(self) -> str:
+        # Formats floats cleanly and removes unnecessary brackets/newlines
+        pos_str = np.array2string(
+            self.pos, precision=3, suppress_small=True, separator=", "
+        )
+        quat_str = np.array2string(
+            self.quat, precision=3, suppress_small=True, separator=", "
+        )
+        return f"Pose(pos={pos_str}, quat={quat_str})"
 
 
 @dataclass(frozen=True)
@@ -28,8 +35,16 @@ class Contact:
     mu: float
     force: np.ndarray = None
 
-    def __str__(self):
-        return f"Contact(pos={self.pos}, normal={self.normal}, mu={self.mu})"
+    def __repr__(self) -> str:
+        # Formats floats cleanly and removes unnecessary brackets/newlines
+        pos_str = np.array2string(
+            self.pos, precision=3, suppress_small=True, separator=", "
+        )
+        normal_str = np.array2string(
+            self.normal, precision=3, suppress_small=True, separator=", "
+        )
+        mu_str = f"{self.mu:.2f}"
+        return f"Contact(pos={pos_str}, normal={normal_str}, mu={mu_str})"
 
 
 @dataclass(frozen=True)
@@ -56,7 +71,7 @@ class Grasp:
         return (
             "Grasp(\n"
             f"  pose={self.pose},\n"
-            f"  width={self.width:.3f},\n"
+            f"  open width={self.width:.3f},\n"
             f"  c1={self.c1},\n"
             f"  c2={self.c2},\n"
             f"  wrench={wrench_str},\n"

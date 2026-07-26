@@ -7,11 +7,12 @@ import meshio
 import numpy as np
 import torch
 import torch.nn.functional as F
-from graph_builder import GraphVisualizer
-from nets import EncodeProcessDecode, MeshGraphNet
-from normalizer import LogNormalizer, Normalizer
 from scipy.stats import kendalltau
-from utils import get_weight, msh_to_trimesh
+
+from meshnet.mgn.graphs import GraphVisualizer
+from src.meshnet.mgn.nets import EncodeProcessDecode, MeshGraphNet
+from src.meshnet.mgn.normalizer import LogNormalizer, Normalizer
+from src.meshnet.utils import get_weight, msh_to_trimesh
 
 LABELS = ["x-displacement", "y-displacement", "z-displacement", "Von Mises Stress"]
 

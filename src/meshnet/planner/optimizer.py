@@ -4,9 +4,10 @@ import meshio
 import numpy as np
 import torch
 
-from meshgraphnet.graph_builder import GraphBuilderVirtual
-from meshgraphnet.simulator import Simulator
-from meshgraphnet.utils import msh_to_trimesh
+from meshnet.mgn.graphs import GraphBuilderVirtual
+from meshnet.mgn.simulator import Simulator
+from meshnet.mgn.utils import msh_to_trimesh
+from meshnet.utils.mesh import Mesh
 
 from .grasp import Contact, Grasp
 from .sampler import GraspSampler
@@ -177,6 +178,58 @@ class GraspOptimizer(ABC):
 class HeuristicBasedGraspOptimizer(GraspOptimizer):
     def __init__(self, gripper):
         super().__init__(gripper)
+
+    def compute_score(self, grasp: Grasp, mesh: Mesh) -> float:
+        """Compute the longest lever arm from the grasp center to the bottom boundary.
+
+        Args:
+            grasp: Grasp containing the two contact positions.
+            mesh: Mesh object.
+
+        Returns:
+            max_arm_length: The longest lever arm distance from the grasp center to the bottom boundary.
+            force: The direction of the force corresponding to the longest arm.
+        """
+        p = (grasp.c1.pos + grasp.c2.pos) / 2
+
+        max_arm_length = 0.0
+        force = None
+
+        for edge in mesh.bottom_boundary_edges:
+            v1, v2 = mesh.surface.vertices[edge]
+
+            edge_vec = v2 - v1
+            edge_length = np.linalg.norm(edge_vec)
+
+            arm_vec = np.cross(edge_vec, p - v1)
+            arm_length = np.linalg.norm(arm_vec) / edge_length
+
+            if arm_length > max_arm_length:
+                max_arm_length = arm_length
+                force = arm_vec / np.linalg.norm(arm_vec)
+
+        return max_arm_length, force
+
+    def optimize(self, mesh, mu, n_samples=10):
+        sampler = GraspSampler(mesh.surface, self.gripper, mu)
+        grasps = sampler.sample(n_samples=n_samples)
+
+        best_grasp = None
+        best_score = 0.0
+        for grasp in grasps:
+            length, f = self.compute_score(grasp, mesh)
+            if length > best_score:
+                best_score = length
+                best_grasp = Grasp(
+                    pose=grasp.pose,
+                    width=grasp.width,
+                    c1=Contact(grasp.c1.pos, grasp.c1.normal, mu),
+                    c2=Contact(grasp.c2.pos, grasp.c2.normal, mu),
+                    wrench=f,
+                    score=best_score,
+                )
+
+        return best_grasp
 
 
 class FEMBasedGraspOptimizer(GraspOptimizer):

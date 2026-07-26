@@ -13,9 +13,9 @@ from torch_geometric.data import Batch
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
-from nets import EncodeProcessDecode, MeshGraphNet
-from normalizer import LogNormalizer, Normalizer
-from utils import get_weight
+from meshnet.mgn.nets import EncodeProcessDecode, MeshGraphNet
+from meshnet.mgn.normalizer import LogNormalizer, Normalizer
+from meshnet.mgn.utils import get_weight
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -40,7 +40,7 @@ class ModelConfig:
     output_dim: int
     num_categorical: int
     latent_dim: int = LATENT_DIM
-    message_passing_steps: int = 15
+    message_passing_steps: int = 5
     use_layer_norm: bool = USE_LAYER_NORM
 
     def as_checkpoint_dict(self) -> dict[str, Any]:

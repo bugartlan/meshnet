@@ -1,19 +1,16 @@
 import argparse
 from pathlib import Path
-from typing import Tuple
 
-import meshio
 import numpy as np
+import numpy.typing as npt
 import torch
 import trimesh
-from graph_builder import (
-    GraphBuilderAugment,
-    GraphBuilderBase,
-    GraphBuilderVirtual,
-)
-from simulator import Simulator
 from tqdm import tqdm
-from utils import info, msh_to_trimesh
+
+from meshnet.mgn.graphs import GraphBuilderVirtual
+from meshnet.mgn.simulator import Simulator
+from meshnet.mgn.utils import info
+from meshnet.utils.mesh import Mesh
 
 
 class DataGenerator:
@@ -22,7 +19,6 @@ class DataGenerator:
         out_dir: Path,
         num_samples: int = 1,
         num_contacts: int = 1,
-        force_max: float = 1.0,
         sigma: float = 0.001,
         seed: int = 42,
         debug: bool = False,
@@ -32,7 +28,6 @@ class DataGenerator:
             out_dir (Path): Output directory for saving data.
             num_samples (int): Number of samples to generate per mesh.
             num_contacts (int): Number of contact points per sample.
-            force_max (float): Maximum magnitude of contact forces.
             sigma (float): Standard deviation for Gaussian kernel in contact force application.
             seed (int): Random seed for reproducibility.
             debug (bool): If True, run in debug mode with verbose output.
@@ -42,8 +37,6 @@ class DataGenerator:
 
         self.num_samples = num_samples
         self.num_contacts = num_contacts
-        self.num_force_per_sample = 5
-        self.force_max = force_max
         self.sigma = sigma
         self.seed = seed
         self.debug = debug
@@ -53,37 +46,40 @@ class DataGenerator:
         # self.builder = GraphBuilder(std=sigma)
         self.builder = GraphBuilderVirtual(std=sigma)
 
-    def process(self, msh_path: Path):
-        """Strategy: CG1 mesh for graph construction and CG2 mesh for simulation accuracy."""
-        if not msh_path.exists():
-            raise FileNotFoundError(f"Mesh file {msh_path} not found.")
+    def process(self, filepath: Path) -> list[torch.Tensor]:
+        """Generate graphs with ground truth labels.
 
-        msh_path_cg1 = msh_path
-        msh_path_cg2 = msh_path.with_name(
-            msh_path.stem.replace("_cg1", "_cg2") + msh_path.suffix
-        )
-        mesh_cg1 = meshio.read(msh_path_cg1)
-        mesh_cg2 = meshio.read(msh_path_cg2)
+        Args:
+            filepath (Path): Path to the mesh file.
 
-        points, forces = self._sample(mesh_cg2)
-        results = self._simulate(msh_path_cg2, points, forces, mesh_cg1.points)
+        Returns:
+            list[torch.Tensor]: A list of graphs with ground truth labels.
+        """
+        if not filepath.exists():
+            raise FileNotFoundError(f"Mesh file {filepath} not found.")
+
+        mesh = Mesh.read(str(filepath))
+
+        points, forces = self._sample(mesh)
+        results = self._simulate(mesh, points, forces)
 
         graphs = []
         for y, p, f in zip(results, points, forces):
-            graphs.append(self.builder.build(mesh_cg1, y, contacts=list(zip(p, f))))
+            graphs.append(self.builder.build(mesh.volume, y, contacts=list(zip(p, f))))
 
         return graphs
 
-    def _sample(self, mesh: meshio.Mesh) -> Tuple[np.ndarray, np.ndarray]:
+    def _sample(
+        self, mesh: Mesh, tol=0.01
+    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
         num_total_points = self.num_samples * self.num_contacts
 
         # Sample 2x buffer to account for filtering
-        mesh = msh_to_trimesh(mesh)
         candidates, _ = trimesh.sample.sample_surface(
-            mesh, count=num_total_points * 5, seed=self.seed
+            mesh.surface, count=num_total_points * 5, seed=self.seed
         )
         # Remove point near bottom (z=0)
-        candidates = candidates[candidates[:, 2] > 0.004]
+        candidates = candidates[candidates[:, 2] >= tol]
         candidates = candidates[:num_total_points]
 
         if len(candidates) < num_total_points:
@@ -94,32 +90,37 @@ class DataGenerator:
         points = candidates.reshape(self.num_samples, self.num_contacts, 3)
 
         # Sample random forces
-        forces = self.rng.standard_normal(
-            size=(self.num_samples * self.num_force_per_sample, self.num_contacts, 3)
+        directions = self.rng.standard_normal(
+            size=(self.num_samples, self.num_contacts, 3)
         )
-        forces = forces / np.linalg.norm(forces, axis=-1, keepdims=True)
+        directions /= np.linalg.norm(directions, axis=-1, keepdims=True)
 
-        return np.repeat(points, self.num_force_per_sample, axis=0), forces
+        magnitudes = self.rng.uniform(
+            0.0, 1.0, size=(self.num_samples, self.num_contacts, 1)
+        )
+
+        forces = directions * magnitudes
+
+        return points, forces
 
     def _simulate(
         self,
-        msh_path: Path,
-        points: np.ndarray,
-        forces: np.ndarray,
-        queries: np.ndarray,
-    ):
-        simulator = Simulator(str(msh_path), std=self.sigma)
+        mesh: Mesh,
+        points: npt.ArrayLike,
+        forces: npt.ArrayLike,
+    ) -> list[npt.NDArray[np.float64]]:
+        simulator = Simulator(mesh, std=self.sigma)
 
         results = []
         for p, f in tqdm(zip(points, forces)):
-            contacts = list(zip(p, f * self.force_max))
-            uh = simulator.run(contacts)
-            vm = simulator.compute_vm1(uh)
+            contacts = list(zip(p, f))
+            displacement = simulator.run(contacts)
+            stress = simulator.compute_stress(displacement, degree=1)
             results.append(
                 np.hstack(
                     [
-                        simulator.probe(uh, queries),
-                        simulator.probe(vm, queries, clip=True),
+                        simulator.evaluate_mesh_points(displacement),
+                        simulator.evaluate_mesh_points(stress),
                     ]
                 )
             )
@@ -165,8 +166,7 @@ def main():
         out_dir=args.out_dir,
         num_samples=args.num_samples,
         num_contacts=args.num_contacts,
-        force_max=1.0,
-        sigma=0.02,
+        sigma=0.01,
         seed=args.seed,
         debug=args.debug,
     )
@@ -176,13 +176,13 @@ def main():
         if path.is_file():
             files.append(path)
         elif path.is_dir():
-            files.extend(path.glob("*_cg1.msh"))
+            files.extend(path.glob("*.msh"))
         else:
             raise RuntimeError(f"Path {path} is not a file or directory.")
 
     for f in files:
         graphs = generator.process(f)
-        out_path = args.out_dir / (f.stem.replace("cg1", f"{len(graphs)}") + ".pt")
+        out_path = args.out_dir / (f.stem + f"_{len(graphs)}.pt")
 
         node_dim, edge_dim, output_dim = info(graphs[0])
         num_categorical = generator.builder.num_categorical

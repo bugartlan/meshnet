@@ -1,7 +1,6 @@
 import argparse
 import math
 from pathlib import Path
-from typing import Optional
 
 import gmsh
 
@@ -37,12 +36,11 @@ class Mesher:
         in_path: Path,
         out_path: Path,
         file_format: str,
-        target_size: Optional[float] = None,
+        target_size: float | None = None,
     ):
         gmsh.clear()
         try:
             if file_format == "stl":
-                print("Scaling is not supported for STL files.")
                 self._mesh_stl(in_path, target_size)
             elif file_format == "step":
                 self._mesh_step(in_path, target_size)
@@ -57,7 +55,7 @@ class Mesher:
             print(f"Error processing {in_path}: {e}")
             return False
 
-    def _mesh_stl(self, path: Path, target_size: Optional[float]):
+    def _mesh_stl(self, path: Path, target_size: float | None):
         gmsh.model.add("mesh_volume_stl")
         gmsh.merge(str(path))
         gmsh.model.geo.removeAllDuplicates()
@@ -78,7 +76,7 @@ class Mesher:
         gmsh.model.geo.synchronize()
         gmsh.model.mesh.generate(3)
 
-    def _mesh_step(self, path: Path, target_size: Optional[float]):
+    def _mesh_step(self, path: Path, target_size: float | None):
         gmsh.model.add("mesh_volume_step")
         gmsh.model.occ.importShapes(str(path))
         gmsh.model.occ.synchronize()
@@ -100,7 +98,7 @@ class Mesher:
 
         gmsh.model.mesh.generate(3)
 
-    def _align_and_scale_occ(self, vol_tag: int, target_size: Optional[float]):
+    def _align_and_scale_occ(self, vol_tag: int, target_size: float | None):
         x0, y0, z0, x1, y1, z1 = gmsh.model.occ.getBoundingBox(3, vol_tag)
 
         cx = 0.5 * (x0 + x1)
@@ -164,8 +162,7 @@ def main():
         stats = {"success": 0, "fail": 0}
 
         for f in files:
-            suffix = "_cg1" if args.element_order == 1 else "_cg2"
-            out_path = args.output / (f.stem + suffix + ".msh")
+            out_path = args.output / (f.stem + ".msh")
             result = mesher.process(f, out_path, args.format, args.target_scale)
 
             if result:

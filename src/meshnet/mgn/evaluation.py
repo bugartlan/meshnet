@@ -9,11 +9,11 @@ import torch
 import torch.nn.functional as F
 from scipy.stats import kendalltau
 
-from graph_builder import GraphBuilderVirtual, GraphVisualizer
-from nets import EncodeProcessDecode
-from normalizer import LogNormalizer, Normalizer
-from simulator import Simulator
-from utils import get_weight, msh_to_trimesh
+from meshnet.mgn.graphs import GraphBuilderVirtual, GraphVisualizer
+from src.meshnet.mgn.nets import EncodeProcessDecode
+from src.meshnet.mgn.normalizer import LogNormalizer, Normalizer
+from src.meshnet.mgn.simulator import Simulator
+from src.meshnet.utils import get_weight, msh_to_trimesh
 
 DATA_FILE = "data/L-Bracket3_100.pt"
 CHECKPOINT_FILE = "models/Model0.pth"

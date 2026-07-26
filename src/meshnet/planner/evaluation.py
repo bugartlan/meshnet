@@ -6,10 +6,10 @@ Then evaluate using the fem solver and compare the rankings
 """
 
 import meshio
-from config import ROBOTIQ_HANDE_GRIPPER
-from sampler import GraspSampler
 
-from meshgraphnet.utils import msh_to_trimesh
+from meshnet.utils.gripper import ROBOTIQ_HANDE_GRIPPER
+from src.meshnet.mgn.utils import msh_to_trimesh
+from src.meshnet.planner.sampler import GraspSampler
 
 msh = meshio.read("../meshes/test/msh/Bushing3_cg1.msh")
 mesh = msh_to_trimesh(msh)
