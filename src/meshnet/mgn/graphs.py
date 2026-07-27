@@ -89,9 +89,7 @@ class GraphBuilderBase:
             )
 
         w_sum = w.sum(axis=0, keepdims=True)
-        if not np.all(np.isfinite(w_sum)) or np.any(
-            w_sum <= np.finfo(np.float64).tiny
-        ):
+        if not np.all(np.isfinite(w_sum)) or np.any(w_sum <= np.finfo(np.float64).tiny):
             raise ValueError(
                 "Contact kernel normalization failed; std may be too small "
                 "for the surface mesh"
@@ -368,19 +366,6 @@ class GraphBuilderVirtual(GraphBuilderBase):
         return edge_index, edge_attr
 
 
-_HTML_SUFFIXES = {".html", ".htm"}
-_IMAGE_SUFFIXES = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".bmp",
-    ".tif",
-    ".tiff",
-    ".webp",
-}
-_VECTOR_SUFFIXES = {".pdf", ".svg", ".eps"}
-
-
 class GraphVisualizer:
     def __init__(self, mesh: trimesh.Trimesh, jupyter_backend: bool = True):
         self.mesh = mesh
@@ -396,9 +381,6 @@ class GraphVisualizer:
             "width": 0.08,
             "height": 0.8,
         }
-
-    def _new_plotter(self) -> pv.Plotter:
-        return pv.Plotter(notebook=self.jupyter_backend)
 
     @staticmethod
     def _graph_contacts(graph: Data) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -433,212 +415,146 @@ class GraphVisualizer:
             )
             plotter.add_mesh(arrow, color="red")
 
-    def _save_stress_plot(
-        self,
-        plotter: pv.Plotter,
-        save_path: str | Path | None,
-    ) -> None:
-        if save_path is None:
-            plotter.show()
-            return
+    @staticmethod
+    def _compute_von_mises(tensor: torch.Tensor) -> torch.Tensor:
+        s_xx, s_yy, s_zz = tensor[:, 0], tensor[:, 1], tensor[:, 2]
+        t_xy, t_yz, t_zx = tensor[:, 3], tensor[:, 4], tensor[:, 5]
 
-        output_path = Path(save_path)
-        suffix = output_path.suffix.lower()
-        output_str = str(output_path)
-
-        if suffix in self._HTML_SUFFIXES:
-            plotter.export_html(output_str)
-        elif suffix in self._IMAGE_SUFFIXES:
-            plotter.window_size = (1600, 1000)
-            plotter.show(screenshot=output_str)
-        else:
-            raise ValueError(
-                "Unsupported save_path extension. Use .html/.htm for HTML export or an image extension like .png/.jpg/.jpeg/.bmp/.tif/.tiff/.webp."
+        return torch.sqrt(
+            0.5
+            * (
+                (s_xx - s_yy) ** 2
+                + (s_yy - s_zz) ** 2
+                + (s_zz - s_xx) ** 2
+                + 6 * (t_xy**2 + t_yz**2 + t_zx**2)
             )
-
-    def _save_bottom_plot(
-        self,
-        plotter: pv.Plotter,
-        save_path: str | Path | None,
-    ) -> None:
-        if not save_path:
-            plotter.show()
-            return
-
-        output_path = Path(save_path)
-        suffix = output_path.suffix.lower()
-        output_str = str(output_path)
-
-        if suffix in self._VECTOR_SUFFIXES:
-            plotter.save_graphic(output_str)
-        elif suffix in self._HTML_SUFFIXES:
-            plotter.export_html(output_str)
-        else:
-            plotter.screenshot(output_str, window_size=[2000, 2000], return_img=False)
+        )
 
     @staticmethod
-    def _save_html_or_show(
-        plotter: pv.Plotter,
-        save_path: str | Path | None,
-    ) -> None:
+    def _save_html_or_show(plotter: pv.Plotter, save_path: str | Path | None) -> None:
         if save_path is not None:
             plotter.export_html(str(save_path))
         else:
             plotter.show()
 
-    def stress(
+    def plot_field(
         self,
         graph: Data,
+        field_data: torch.Tensor,
+        field_name: str,
+        save_path: str | Path | None = None,
         cmap: str = "Oranges",
         clim: tuple | None = None,
-        show_contacts: bool = True,
-        save_path: str | None = None,
-        debug: bool = False,
         scalar_bar_args: dict | None = None,
+        show_contacts: bool = True,
+        clip_bottom: bool = False,
+        debug: bool = False,
     ):
-        n_phys = graph.num_physical_nodes
-        self.pv_mesh.point_data["von_mises"] = (
-            graph.y.detach().cpu().numpy()[:n_phys, 3]
-        )
+        """Unified plotting pipeline for scalar or vector fields on graph nodes."""
+        self.pv_mesh.point_data[field_name] = field_data
 
-        plotter = self._new_plotter()
+        if clip_bottom:
+            pv_mesh = self.pv_mesh.clip(normal=(0, 0, 1), origin=(0, 0, 1e-6))
+        else:
+            pv_mesh = self.pv_mesh
+
+        # Configure PyVista plotter
+        plotter = pv.Plotter(notebook=self.jupyter_backend)
         plotter.add_mesh(
-            self.pv_mesh,
-            scalars="von_mises",
+            pv_mesh,
+            scalars=field_name,
             point_size=1,
             render_points_as_spheres=True,
             show_edges=True,
             clim=clim,
-            scalar_bar_args=scalar_bar_args,
+            scalar_bar_args=scalar_bar_args or self._default_scalar_bar_args(),
             cmap=cmap,
         )
 
-        contacts = self._graph_contacts(graph)
-        if show_contacts and len(contacts) > 0:
-            scale = self._mesh_scale(ratio=0.1)
-            self._add_contact_vectors(
-                plotter,
-                contacts=contacts,
-                arrow_scale=scale,
-                sphere_radius=scale * 0.1,
-                debug=debug,
-            )
+        # Optional contacts rendering
+        if show_contacts:
+            contacts = self._graph_contacts(graph)
+            if len(contacts) > 0:
+                scale = self._mesh_scale(ratio=0.1)
+                self._add_contact_vectors(
+                    plotter,
+                    contacts=contacts,
+                    arrow_scale=scale,
+                    sphere_radius=scale * 0.1,
+                    debug=debug,
+                )
 
         plotter.show_axes()
-        if save_path is not None:
-            suffix = Path(save_path).suffix.lower()
-            if suffix in {".html", ".htm"}:
-                plotter.export_html(save_path)
-            elif suffix in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}:
-                plotter.window_size = (1600, 1000)
-                plotter.show(screenshot=save_path)
-            else:
-                raise ValueError(
-                    "Unsupported save_path extension. Use .html/.htm for HTML export or an image extension like .png/.jpg/.jpeg/.bmp/.tif/.tiff/.webp."
-                )
-        else:
-            plotter.show()
+        self._save_html_or_show(plotter, save_path=save_path)
         return plotter
+
+    def von_mises(
+        self,
+        graph: Data,
+        save_path: str | None = None,
+        cmap: str = "Oranges",
+        clim: tuple | None = None,
+        scalar_bar_args: dict | None = None,
+        show_contacts: bool = False,
+        clip_bottom: bool = False,
+        debug: bool = False,
+    ):
+        n_phys = graph.num_physical_nodes
+        vm = self._compute_von_mises(graph.y).detach().cpu().numpy()[:n_phys]
+        return self.plot_field(
+            graph=graph,
+            field_data=vm,
+            field_name="von_mises",
+            save_path=save_path,
+            cmap=cmap,
+            clim=clim,
+            scalar_bar_args=scalar_bar_args,
+            show_contacts=show_contacts,
+            clip_bottom=clip_bottom,
+            debug=debug,
+        )
 
     def displacement(
         self,
         graph: Data,
         cmap: str = "Oranges",
         clim: tuple | None = None,
+        show_contacts: bool = False,
         save_path: str | Path | None = None,
+        scalar_bar_args: dict | None = None,
         debug: bool = False,
     ):
         n_phys = graph.num_physical_nodes
-        self.pv_mesh.point_data["displacement"] = (
-            graph.y.detach().cpu().numpy()[:n_phys, :3]
-        )
-
-        _ = debug
-        scalar_bar_args = self._default_scalar_bar_args()
-
-        plotter = self._new_plotter()
-        plotter.add_mesh(
-            self.pv_mesh,
-            scalars="displacement",
-            point_size=1,
-            render_points_as_spheres=True,
-            show_edges=True,
+        disp = graph.y.detach().cpu().numpy()[:n_phys, :3]
+        return self.plot_field(
+            graph=graph,
+            field_data=disp,
+            field_name="displacement",
+            save_path=save_path,
+            cmap=cmap,
             clim=clim,
             scalar_bar_args=scalar_bar_args,
-            cmap=cmap,
+            show_contacts=show_contacts,
+            debug=debug,
         )
 
-        plotter.show_axes()
-        self._save_html_or_show(plotter, save_path=save_path)
-
-    def bottom(
+    def force(
         self,
         graph: Data,
         cmap: str = "Oranges",
-        clim: tuple | None = None,
-        show_axes: bool = False,
-        show_scalar_bar: bool = False,
-        scalar_bar_args: dict | None = None,
         save_path: str | Path | None = None,
+        scalar_bar_args: dict | None = None,
+        debug: bool = False,
     ):
-        # First, add von_mises to the full mesh
         n_phys = graph.num_physical_nodes
-        self.pv_mesh.point_data["von_mises"] = (
-            graph.y.detach().cpu().numpy()[:n_phys, 3]
-        )
-
-        if scalar_bar_args is None:
-            scalar_bar_args = self._default_scalar_bar_args()
-
-        # Then clip the mesh with the data already assigned
-        pv_mesh_boundary = self.pv_mesh.clip(normal=(0, 0, 1), origin=(0, 0, 1e-6))
-
-        plotter = self._new_plotter()
-        plotter.add_mesh(
-            pv_mesh_boundary,
-            scalars="von_mises",
-            point_size=1,
+        force = graph.x[:n_phys, 3:6].norm(dim=1).detach().cpu().numpy()[:n_phys]
+        return self.plot_field(
+            graph=graph,
+            field_data=force,
+            field_name="force",
+            save_path=save_path,
             cmap=cmap,
-            clim=clim,
-            render_points_as_spheres=True,
-            show_edges=True,
-            show_scalar_bar=show_scalar_bar,
             scalar_bar_args=scalar_bar_args,
+            show_contacts=True,
+            debug=debug,
         )
-        plotter.camera.tight(padding=0.0)
-
-        if show_axes:
-            plotter.show_axes()
-
-        self._save_bottom_plot(plotter, save_path=save_path)
-
-    def force(self, graph: Data, cmap: str = "Oranges", show_force: bool = True):
-        n_phys = graph.num_physical_nodes
-        self.pv_mesh.point_data["force_magnitude"] = (
-            graph.x[:n_phys, 3:6].norm(dim=1).detach().cpu().numpy()
-        )
-
-        scalar_bar_args = self._default_scalar_bar_args()
-
-        plotter = self._new_plotter()
-        plotter.add_mesh(
-            self.pv_mesh,
-            scalars="force_magnitude",
-            cmap=cmap,
-            point_size=1,
-            render_points_as_spheres=True,
-            show_edges=True,
-            scalar_bar_args=scalar_bar_args,
-        )
-
-        contacts = self._graph_contacts(graph)
-        if show_force and len(contacts) > 0:
-            self._add_contact_vectors(
-                plotter,
-                contacts=contacts,
-                arrow_scale=0.01,
-            )
-
-        plotter.show_axes()
-        plotter.show()
-        return plotter

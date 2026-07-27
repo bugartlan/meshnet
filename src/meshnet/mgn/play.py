@@ -7,12 +7,11 @@ import meshio
 import numpy as np
 import torch
 import torch.nn.functional as F
-from scipy.stats import kendalltau
 
 from meshnet.mgn.graphs import GraphVisualizer
 from meshnet.mgn.nets import EncodeProcessDecode, MeshGraphNet
 from meshnet.mgn.normalizer import LogNormalizer, Normalizer
-from meshnet.mgn.utils import get_weight, msh_to_trimesh
+from meshnet.mgn.utils import msh_to_trimesh
 
 LABELS = ["x-displacement", "y-displacement", "z-displacement", "Von Mises Stress"]
 
@@ -22,7 +21,6 @@ class PredictionResult:
     """Stores the predicted graph and its evaluation metrics for one sample."""
 
     graph: object
-    kendall_tau: float
     loss: float
     loss75: float
 
@@ -42,34 +40,25 @@ class PlotPaths:
 
 
 def prepare_graphs(graphs: list, normalizer: Normalizer, mode: str = "bottom"):
-    """Normalize graphs and attach per-node importance weights.
+    """Normalize graphs and create loss masks.
 
     Args:
         graphs: Raw graph objects to normalise.
         normalizer: Fitted normalizer instance.
-        mode: Weighting mode passed to ``get_weight``.
+        mode: `bottom` to include only the bottom surface in the loss, `all` to include all nodes.
 
     Returns:
-        List of normalised graph objects with a ``weight`` attribute.
+        List of normalised graph objects with a ``loss_mask`` attribute.
     """
     normalized_graphs = []
 
     for graph in graphs:
         graph_norm = normalizer.normalize(graph)
 
-        weight = get_weight(graph.x[:, 2], 1, mode=mode)
-        num_physical = int(graph.num_physical_nodes)
-        if not 0 < num_physical <= graph.num_nodes:
-            raise ValueError(
-                f"Invalid num_physical_nodes={num_physical} for "
-                f"{graph.num_nodes} total nodes."
-            )
-        loss_mask = torch.zeros(
-            graph.num_nodes, dtype=torch.bool, device=graph.x.device
-        )
-        loss_mask[:num_physical] = True
+        num_phys = int(graph.num_physical_nodes)
+        loss_mask = torch.zeros_like(graph.x[:, 0], dtype=torch.bool)
+        loss_mask[:num_phys] = mode != "bottom" or graph.x[:num_phys, 2] <= 1e-4
 
-        graph_norm.weight = weight
         graph_norm.loss_mask = loss_mask
         graph_norm.y = graph.y
         normalized_graphs.append(graph_norm)
@@ -82,39 +71,18 @@ def prepare_graphs(graphs: list, normalizer: Normalizer, mode: str = "bottom"):
 # ---------------------------------------------------------------------------
 
 
-def mae75(pred: np.ndarray, true: np.ndarray, weight: np.ndarray) -> float:
+def mae75(pred: np.ndarray, true: np.ndarray) -> float:
     """Mean absolute error restricted to nodes above the 75th-percentile of *true*.
 
     Args:
         pred: Predicted values.
         true: Ground-truth values.
-        weight: Per-node weights; nodes with ``weight <= 0`` are excluded.
 
     Returns:
         Scalar MAE over the top-25 % of ground-truth values.
     """
-    x = pred[weight > 0]
-    y = true[weight > 0]
-    mask = y >= np.percentile(y, 75)
-    return np.abs(x - y)[mask].mean()
-
-
-def compute_kendall_tau(
-    pred: np.ndarray, true: np.ndarray, weight: np.ndarray
-) -> float:
-    """Kendall's τ rank-correlation between *pred* and *true*.
-
-    Args:
-        pred: Predicted values.
-        true: Ground-truth values.
-        weight: Per-node weights; nodes with ``weight <= 0`` are excluded.
-
-    Returns:
-        Kendall's τ statistic.
-    """
-    x = pred[weight > 0]
-    y = true[weight > 0]
-    return kendalltau(x, y).statistic
+    top = true >= np.percentile(true, 75)
+    return np.abs(pred[top] - true[top]).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +149,38 @@ def plot(g_true, g_pred, visualizer: GraphVisualizer, mode: str, paths: PlotPath
         render(graph, clim=clim, save_path=out_path)
 
 
+def render_stress(g_true, g_pred, visualizer: GraphVisualizer, paths: PlotPaths):
+    """Render and save ground-truth, prediction, and absolute-error plots.
+
+    Args:
+        g_true: Graph carrying ground-truth labels.
+        g_pred: Graph carrying predicted labels.
+        visualizer: ``GraphVisualizer`` instance bound to the mesh.
+        paths: Output file paths for the three plot files.
+    """
+    for graph, out_path in (
+        (g_true, paths.true),
+        (g_pred, paths.pred),
+    ):
+        visualizer.stress(graph, save_path=out_path)
+
+
+def render_displacement(g_true, g_pred, visualizer: GraphVisualizer, paths: PlotPaths):
+    """Render and save ground-truth, prediction, and absolute-error plots.
+
+    Args:
+        g_true: Graph carrying ground-truth labels.
+        g_pred: Graph carrying predicted labels.
+        visualizer: ``GraphVisualizer`` instance bound to the mesh.
+        paths: Output file paths for the three plot files.
+    """
+    for graph, out_path in (
+        (g_true, paths.true),
+        (g_pred, paths.pred),
+    ):
+        visualizer.displacement(graph, save_path=out_path)
+
+
 # ---------------------------------------------------------------------------
 # Model / normalizer helpers
 # ---------------------------------------------------------------------------
@@ -198,12 +198,12 @@ def build_normalizer(checkpoint: dict, device: torch.device):
     """
     params = checkpoint["params"]
     stats = checkpoint["stats"]
-    kwargs = dict(
-        num_features=params["node_dim"],
-        num_categorical=params["num_categorical"],
-        device=device,
-        stats=stats,
-    )
+    kwargs = {
+        "num_features": params["node_dim"],
+        "num_categorical": params["num_categorical"],
+        "device": device,
+        "stats": stats,
+    }
     if checkpoint["normalizer"] == "LogNormalizer":
         return LogNormalizer(**kwargs)
     return Normalizer(**kwargs)
@@ -265,25 +265,12 @@ def run_inference(
             loss_mask = g.loss_mask
             y_true = g.y[loss_mask][:, target_indices]
             y_pred = g_pred.y[loss_mask][:, target_indices]
-            weight = g.weight[loss_mask].expand_as(y_pred)
-            weight_np = weight.cpu().numpy()
 
-            loss = F.l1_loss(y_pred, y_true, weight=weight).item()
-            loss75 = mae75(
-                y_pred.cpu().numpy(),
-                y_true.cpu().numpy(),
-                weight=weight_np,
-            )
-            tau = compute_kendall_tau(
-                y_pred.cpu().numpy(),
-                y_true.cpu().numpy(),
-                weight=weight_np,
-            )
+            loss = F.l1_loss(y_pred, y_true).item()
+            loss75 = mae75(y_pred.cpu().numpy(), y_true.cpu().numpy())
 
             results.append(
-                PredictionResult(
-                    graph=g_pred.cpu(), kendall_tau=tau, loss=loss, loss75=loss75
-                )
+                PredictionResult(graph=g_pred.cpu(), loss=loss, loss75=loss75)
             )
     elapsed = time.time() - start
 
@@ -297,56 +284,48 @@ def run_inference(
 
 def save_plots(
     results: list[PredictionResult],
-    graphs_original: list,
-    msh_path: Path,
+    graphs: list,
+    filepath: Path,
     visualizer: GraphVisualizer,
     mode: str,
-    plot_dir: Path,
-    n_random: int,
+    directory: Path,
+    n_random: int = 1,
+    fields: str = "displacement",
 ) -> None:
-    """Save plots for the best/worst τ samples and *n_random* random samples.
+    """Save plots for *n_random* random samples.
 
     Args:
         results: Per-sample prediction results from ``run_inference``.
-        graphs_original: Un-normalised ground-truth graphs (CPU tensors).
-        msh_path: Path to the source mesh file (stem used in filenames).
+        graphs: Un-normalised ground-truth graphs (CPU tensors).
+        filepath: Path to the source mesh file (stem used in filenames).
         visualizer: ``GraphVisualizer`` bound to the loaded mesh.
         mode: ``"bottom"`` or ``"all"``.
-        plot_dir: Directory where HTML plot files are written.
-        n_random: Number of random samples to visualise in addition to extremes.
+        directory: Directory where HTML plot files are written.
+        n_random: Number of random samples to visualize.
+        fields: List of field names to include in the plots.
     """
     suffix = "_bottom" if mode == "bottom" else ""
 
     def _make_paths(tag: str) -> PlotPaths:
         return PlotPaths(
-            true=plot_dir / f"{msh_path.stem}_{tag}_true{suffix}.html",
-            pred=plot_dir / f"{msh_path.stem}_{tag}_pred{suffix}.html",
-            error=plot_dir / f"{msh_path.stem}_{tag}_error{suffix}.html",
+            true=directory / f"{filepath.stem}_{tag}_true{suffix}.html",
+            pred=directory / f"{filepath.stem}_{tag}_pred{suffix}.html",
+            error=directory / f"{filepath.stem}_{tag}_error{suffix}.html",
         )
 
-    def _plot_and_log(idx: int, tag: str) -> None:
-        result = results[idx]
-        plot(
-            graphs_original[idx].cpu(), result.graph, visualizer, mode, _make_paths(tag)
-        )
+    n_random = min(n_random, len(results))
+    print(f"Generating {n_random} random plots in {directory}...")
+    for i in np.random.choice(len(results), size=n_random, replace=False):
+        true = graphs[i].cpu()
+        pred = results[i].graph
+        if fields == "displacement":
+            render_displacement(true, pred, visualizer, _make_paths(f"#{i}"))
+        else:
+            render_stress(true, pred, visualizer, _make_paths(f"#{i}"))
         print(
-            f"Saved plots for {tag} (sample {idx}, {msh_path.stem}): "
-            f"tau={result.kendall_tau:.4f}, loss={result.loss:.6f}, "
-            f"loss75={result.loss75:.6f}."
+            f"Saved plot (sample {i}, {filepath.stem}): "
+            f"loss={results[i].loss:.6f}, loss75={results[i].loss75:.6f}."
         )
-
-    min_idx = min(range(len(results)), key=lambda i: results[i].kendall_tau)
-    max_idx = max(range(len(results)), key=lambda i: results[i].kendall_tau)
-    _plot_and_log(min_idx, "min_tau")
-    _plot_and_log(max_idx, "max_tau")
-
-    rng = np.random.default_rng(42)
-    random_indices = rng.choice(
-        len(results), size=min(n_random, len(results)), replace=False
-    )
-    print(f"Generating {len(random_indices)} random plots in {plot_dir}...")
-    for i in random_indices:
-        _plot_and_log(i, f"smpl{i}")
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +371,7 @@ def parse_args():
         "-n",
         type=int,
         default=1,
-        help="Number of random samples to visualise.",
+        help="Number of random samples to visualize.",
     )
     p.add_argument(
         "--device",
@@ -426,9 +405,7 @@ def main():
     )
 
     # Load checkpoint
-    checkpoint = torch.load(
-        args.checkpoint, map_location="cpu", weights_only=True
-    )
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     params = checkpoint["params"]
     print(
         f"Loaded checkpoint '{args.checkpoint}' — "
@@ -462,15 +439,10 @@ def main():
     n = len(results)
     avg_loss = sum(r.loss for r in results) / n
     avg_loss75 = sum(r.loss75 for r in results) / n
-    avg_tau = sum(r.kendall_tau for r in results) / n
-    min_tau = min(r.kendall_tau for r in results)
-    max_tau = max(r.kendall_tau for r in results)
 
     print("Results:")
     print(f"  Avg L1 loss:              {avg_loss:.6f}")
     print(f"  Avg L1 loss (75th pct):   {avg_loss75:.6f}")
-    print(f"  Avg Kendall's τ:          {avg_tau:.4f}")
-    print(f"  Min / Max τ:              {min_tau:.4f} / {max_tau:.4f}")
 
     # Optionally save visualisation plots
     if args.plots:
