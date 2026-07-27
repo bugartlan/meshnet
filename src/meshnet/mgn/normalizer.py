@@ -4,6 +4,17 @@ from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
 
+def _physical_node_mask(batch: Data) -> torch.Tensor:
+    """Return a mask for the physical-node prefix of every graph in a batch."""
+    counts = torch.as_tensor(
+        batch.num_physical_nodes, device=batch.x.device, dtype=torch.long
+    ).flatten()
+    local_indices = torch.arange(batch.num_nodes, device=batch.x.device) - batch.ptr[
+        batch.batch
+    ]
+    return local_indices < counts[batch.batch]
+
+
 class Normalizer:
     def __init__(
         self,
@@ -37,6 +48,7 @@ class Normalizer:
         )
 
         total_nodes = 0
+        total_target_nodes = 0
         total_edges = 0
         pos_sum, pos_sq_sum = 0.0, 0.0
         edge_sum, edge_sq_sum = 0.0, 0.0
@@ -47,9 +59,12 @@ class Normalizer:
 
             pos = batch.x[:, :3]
             edge = batch.edge_attr
-            y = batch.y
+            # Virtual-node targets are artificial zero padding and must not
+            # influence the scale used for physical prediction targets.
+            y = batch.y[_physical_node_mask(batch)]
 
             total_nodes += pos.shape[0]
+            total_target_nodes += y.shape[0]
             total_edges += edge.shape[0]
 
             pos_sum += pos.sum(dim=0)
@@ -63,7 +78,7 @@ class Normalizer:
 
         self.pos_mean = pos_sum / total_nodes
         self.edge_mean = edge_sum / total_edges
-        self.y_mean = y_sum / total_nodes
+        self.y_mean = y_sum / total_target_nodes
 
         pos_var = (pos_sq_sum / total_nodes) - (self.pos_mean**2)
         self.pos_std = torch.sqrt(torch.clamp(pos_var, min=0.0)) + 1e-6
@@ -71,7 +86,7 @@ class Normalizer:
         edge_var = (edge_sq_sum / total_edges) - (self.edge_mean**2)
         self.edge_std = torch.sqrt(torch.clamp(edge_var, min=0.0)) + 1e-6
 
-        y_var = (y_sq_sum / total_nodes) - (self.y_mean**2)
+        y_var = (y_sq_sum / total_target_nodes) - (self.y_mean**2)
         self.y_std = torch.sqrt(torch.clamp(y_var, min=0.0)) + 1e-6
 
         self.stats = {
@@ -176,25 +191,44 @@ class Normalizer:
 
 
 class LogNormalizer(Normalizer):
+    @staticmethod
+    def _log_stress(stress: torch.Tensor) -> torch.Tensor:
+        """Compress signed stress values without producing NaNs."""
+        return torch.sign(stress) * torch.log1p(torch.abs(stress))
+
+    @staticmethod
+    def _exp_stress(log_stress: torch.Tensor) -> torch.Tensor:
+        """Invert :meth:`_log_stress`."""
+        return torch.sign(log_stress) * torch.expm1(torch.abs(log_stress))
+
     def fit(self, graphs: list[Data]):
         all_pos = torch.cat([g.x[:, :3] for g in graphs], dim=0)
         all_edge = torch.cat([g.edge_attr for g in graphs], dim=0)
 
-        all_y_raw = torch.cat([g.y for g in graphs], dim=0)
+        all_y_raw = torch.cat(
+            [g.y[: int(g.num_physical_nodes)] for g in graphs], dim=0
+        )
         all_disp = all_y_raw[:, :3]  # x, y, z displacements
-        all_stress = all_y_raw[:, 3:]  # Von Mises stress
-        all_stress_log = torch.log1p(all_stress)
+        all_stress = all_y_raw[:, 3:]
+        all_stress_log = self._log_stress(all_stress)
         all_y_mixed = torch.cat([all_disp, all_stress_log], dim=1)
 
         self._set_stats(all_pos, all_y_mixed, all_edge)
 
     def normalize(self, graph: Data) -> Data:
         g = graph.clone()
-        g.y[:, 3] = torch.log1p(g.y[:, 3])
-
+        g.y[:, 3:] = self._log_stress(g.y[:, 3:])
         return super().normalize(g)
+
+    def normalize_(self, graph: Data) -> Data:
+        graph.y[:, 3:] = self._log_stress(graph.y[:, 3:])
+        super().normalize_(graph)
+
+    def normalize_batch(self, batch: Data) -> Data:
+        batch.y[:, 3:] = self._log_stress(batch.y[:, 3:])
+        return super().normalize_batch(batch)
 
     def denormalize_y(self, y: torch.Tensor) -> torch.Tensor:
         log_y = super().denormalize_y(y)
-        log_y[:, 3] = torch.expm1(log_y[:, 3])
+        log_y[:, 3:] = self._exp_stress(log_y[:, 3:])
         return log_y

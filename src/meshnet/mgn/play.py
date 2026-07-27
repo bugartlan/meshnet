@@ -10,9 +10,9 @@ import torch.nn.functional as F
 from scipy.stats import kendalltau
 
 from meshnet.mgn.graphs import GraphVisualizer
-from src.meshnet.mgn.nets import EncodeProcessDecode, MeshGraphNet
-from src.meshnet.mgn.normalizer import LogNormalizer, Normalizer
-from src.meshnet.utils import get_weight, msh_to_trimesh
+from meshnet.mgn.nets import EncodeProcessDecode, MeshGraphNet
+from meshnet.mgn.normalizer import LogNormalizer, Normalizer
+from meshnet.mgn.utils import get_weight, msh_to_trimesh
 
 LABELS = ["x-displacement", "y-displacement", "z-displacement", "Von Mises Stress"]
 
@@ -58,10 +58,19 @@ def prepare_graphs(graphs: list, normalizer: Normalizer, mode: str = "bottom"):
         graph_norm = normalizer.normalize(graph)
 
         weight = get_weight(graph.x[:, 2], 1, mode=mode)
-        # Only weight physical nodes, not virtual nodes
-        weight = weight * (graph.x[:, -1] != 1.0).unsqueeze(1).float()
+        num_physical = int(graph.num_physical_nodes)
+        if not 0 < num_physical <= graph.num_nodes:
+            raise ValueError(
+                f"Invalid num_physical_nodes={num_physical} for "
+                f"{graph.num_nodes} total nodes."
+            )
+        loss_mask = torch.zeros(
+            graph.num_nodes, dtype=torch.bool, device=graph.x.device
+        )
+        loss_mask[:num_physical] = True
 
         graph_norm.weight = weight
+        graph_norm.loss_mask = loss_mask
         graph_norm.y = graph.y
         normalized_graphs.append(graph_norm)
 
@@ -208,17 +217,14 @@ def get_target_indices(target: str) -> list[int]:
 
     Returns:
         List of integer column indices.
-
-    Raises:
-        ValueError: If *target* is not recognised.
     """
     match target:
         case "all":
-            return list(range(4))
+            return list(range(9))
         case "displacement":
             return list(range(3))
         case "stress":
-            return [3]
+            return list(range(3, 9))
         case _:
             raise ValueError(f"Unknown target: {target!r}")
 
@@ -256,11 +262,13 @@ def run_inference(
             g_pred = g.clone()
             g_pred.y = y_pred
 
-            y_true = g.y[:, target_indices]
-            y_pred = g_pred.y[:, target_indices]
-            weight_np = g.weight.cpu().numpy()
+            loss_mask = g.loss_mask
+            y_true = g.y[loss_mask][:, target_indices]
+            y_pred = g_pred.y[loss_mask][:, target_indices]
+            weight = g.weight[loss_mask].expand_as(y_pred)
+            weight_np = weight.cpu().numpy()
 
-            loss = F.l1_loss(y_pred, y_true, weight=g.weight).item()
+            loss = F.l1_loss(y_pred, y_true, weight=weight).item()
             loss75 = mae75(
                 y_pred.cpu().numpy(),
                 y_true.cpu().numpy(),
@@ -409,7 +417,7 @@ def main():
     device = torch.device(args.device)
 
     # Load dataset
-    data = torch.load(f"data/{args.dataset}.pt", weights_only=False)
+    data = torch.load(args.dataset, weights_only=False)
     graphs = [g.to(device) for g in data["graphs"]]
     msh_path: Path = data["mesh"]
     print(f"Loaded dataset '{args.dataset}' with {len(graphs)} graphs.")
@@ -419,7 +427,7 @@ def main():
 
     # Load checkpoint
     checkpoint = torch.load(
-        f"models/{args.checkpoint}.pth", map_location="cpu", weights_only=True
+        args.checkpoint, map_location="cpu", weights_only=True
     )
     params = checkpoint["params"]
     print(

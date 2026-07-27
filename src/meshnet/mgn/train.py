@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from torch_geometric.data import Batch
 from torch_geometric.loader import DataLoader
@@ -91,7 +90,7 @@ def parse_args():
     p.add_argument(
         "--dataset",
         type=str,
-        default="Primitives100",
+        default=None,
         help="Name of the graph dataset file (without extension) or folder.",
     )
 
@@ -127,7 +126,7 @@ def parse_args():
     p.add_argument(
         "--layers",
         type=int,
-        default=15,
+        default=5,
         help="Number of message-passing steps.",
     )
 
@@ -179,14 +178,6 @@ def setup_directories(args: argparse.Namespace, checkpoint_dir: Path) -> None:
         args.log_dir.mkdir(parents=True, exist_ok=True)
 
 
-def resolve_model_name(args: argparse.Namespace) -> str:
-    """Derive a model filename stem from training arguments when no name is given."""
-    if args.output_name:
-        return args.output_name
-    suffix = "w" if args.weighted_loss else "uw"
-    return f"{args.dataset}_{args.target}_{suffix}"
-
-
 # ---------------------------------------------------------------------------
 # Data Helpers
 # ---------------------------------------------------------------------------
@@ -206,7 +197,7 @@ def load_graphs_and_params(dataset_name: str) -> tuple[list[Any], dict[str, Any]
     Raises:
         ValueError: If no graphs are found or the directory contains no ``.pt`` files.
     """
-    dataset_path = Path("data") / dataset_name
+    dataset_path = Path(dataset_name)
 
     if dataset_path.is_dir():
         graphs: list[Any] = []
@@ -221,7 +212,7 @@ def load_graphs_and_params(dataset_name: str) -> tuple[list[Any], dict[str, Any]
         if params is None:
             raise ValueError(f"# .pt files found in dataset folder: {dataset_path}")
     else:
-        dataset_path = Path("data") / f"{dataset_name}.pt"
+        dataset_path = f"{dataset_name}.pt"
         loaded = torch.load(dataset_path, weights_only=False)
         graphs = loaded["graphs"]
         params = loaded["params"]
@@ -245,42 +236,13 @@ def get_target_indices(target: str) -> list[int]:
         ValueError: If *target* is not recognised.
     """
     targets: dict[str, list[int]] = {
-        "all": [0, 1, 2, 3],
+        "all": [0, 1, 2, 3, 4, 5, 6, 7, 8],
         "displacement": [0, 1, 2],
-        "stress": [3],
+        "stress": [3, 4, 5, 6, 7, 8],
     }
     if target not in targets:
         raise ValueError(f"Unknown target: {target}")
     return targets[target]
-
-
-def prepare_graphs(
-    graphs, normalizer, weighted_loss: bool, alpha: float, num_targets: int
-):
-    """Normalise graphs and attach per-node importance weights.
-
-    Args:
-        graphs: Raw graph objects.
-        normalizer: Fitted normalizer instance.
-        weighted_loss: Whether to use distance-based weighting.
-        alpha: Exponential scaling factor for the weighted mode.
-        num_targets: Number of target output dimensions (sets weight column count).
-
-    Returns:
-        List of normalised graph objects with a ``weight`` attribute.
-    """
-    mode = "weighted" if weighted_loss else "all"
-
-    for graph in tqdm(graphs, desc="Preparing graphs", dynamic_ncols=True):
-        weight = get_weight(
-            graph.x[:, 2],
-            num_targets,
-            mode=mode,
-            alpha=alpha,
-        )
-        weight.mul_((graph.x[:, -1] != 1.0).unsqueeze(1).float())
-        normalizer.normalize_(graph)
-        graph.weight = weight
 
 
 def prepare_graphs_fast(
@@ -291,15 +253,15 @@ def prepare_graphs_fast(
     num_targets: int,
     device="cpu",
 ):
-    """Refactored to process all graphs at once on the GPU/CPU."""
+    """Normalize graphs and attach loss metadata for physical mesh nodes."""
     mode = "weighted" if weighted_loss else "all"
 
     # 1. Collate all individual graphs into one giant Batch
     batch = Batch.from_data_list(graphs).to(device)
     normalizer.to(device)
 
-    # 2. Compute weights for EVERY node in the dataset simultaneously
-    # This assumes get_weight is written using torch operations
+    # 2. Compute weights for every node. Virtual-node values are discarded below,
+    # so they cannot contribute to either the numerator or denominator of the loss.
     weights = get_weight(
         batch.x[:, 2],
         num_targets,
@@ -307,10 +269,15 @@ def prepare_graphs_fast(
         alpha=alpha,
     )
 
-    # 3. Apply physical node mask (vectorized)
-    # batch.x[:, -1] is the categorical 'node type' column
-    is_physical = (batch.x[:, -1] != 1.0).unsqueeze(1).float()
-    batch.weight = weights * is_physical
+    # 3. Mark the physical prefix of each graph explicitly. Using x[:, -1] is not
+    # safe: for graph builders without virtual nodes, the last feature is the
+    # boundary flag and real boundary nodes would be removed from the loss.
+    batch.loss_mask = torch.zeros(batch.num_nodes, dtype=torch.bool, device=device)
+    for graph_index, graph in enumerate(graphs):
+        start = int(batch.ptr[graph_index].item())
+        num_physical = int(graph.num_physical_nodes)
+        batch.loss_mask[start : start + num_physical] = True
+    batch.weight = weights
 
     # 4. Normalize the entire batch in one call
     batch = normalizer.normalize_batch(batch)
@@ -320,7 +287,8 @@ def prepare_graphs_fast(
     for i, g in enumerate(graphs_out):
         s = int(batch.ptr[i].item())
         e = int(batch.ptr[i + 1].item())
-        g.weight = weights[s:e]
+        g.weight = batch.weight[s:e]
+        g.loss_mask = batch.loss_mask[s:e]
 
     return graphs_out
 
@@ -373,48 +341,21 @@ def build_model(config: ModelConfig, device: torch.device) -> EncodeProcessDecod
     ).to(device)
 
 
-def build_optimizer(
-    model: EncodeProcessDecode, learning_rate: float
-) -> torch.optim.Adam:
-    """Create an Adam optimiser for *model*.
-
-    Args:
-        model: Model whose parameters will be optimised.
-        learning_rate: Initial learning rate.
-
-    Returns:
-        Configured ``Adam`` optimiser.
-    """
-    return torch.optim.Adam(model.parameters(), lr=learning_rate)
 
 
-def build_scheduler(
-    optimizer: torch.optim.Optimizer,
-) -> torch.optim.lr_scheduler.ExponentialLR:
-    """Create an exponential LR scheduler with a fixed gamma.
-
-    Args:
-        optimizer: Optimiser to wrap.
-
-    Returns:
-        ``ExponentialLR`` scheduler (gamma = 0.998).
-    """
-    return torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.998)
-
-
-def create_tensorboard_writer(args: argparse.Namespace, model_name: str):
+def create_tensorboard_writer(args: argparse.Namespace, subdirectory: str):
     """Optionally create a TensorBoard ``SummaryWriter``.
 
     Args:
         args: Parsed CLI arguments.
-        model_name: Subdirectory name within the log directory.
+        subdirectory: Subdirectory name within the log directory.
 
     Returns:
         ``(writer, log_path)`` if TensorBoard is enabled, else ``(None, None)``.
     """
     if not args.tensorboard:
         return None, None
-    log_path = args.log_dir / model_name
+    log_path = args.log_dir / subdirectory
     writer = SummaryWriter(log_dir=log_path)
     print(f"TensorBoard logging to: {log_path}")
     return writer, log_path
@@ -423,6 +364,32 @@ def create_tensorboard_writer(args: argparse.Namespace, model_name: str):
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+
+
+def weighted_mse_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """Return ``sum(weight * squared_error) / sum(weight)``.
+
+    An explicit reduction makes zero-weight masking independent of PyTorch's
+    built-in loss reduction semantics and keeps the scale invariant to the
+    number of virtual nodes.
+    """
+    if prediction.shape != target.shape or weight.shape != prediction.shape:
+        raise ValueError(
+            "prediction, target, and weight must have identical shapes; got "
+            f"{prediction.shape}, {target.shape}, and {weight.shape}."
+        )
+    if torch.any(weight < 0):
+        raise ValueError("Loss weights must be non-negative.")
+
+    total_weight = weight.sum()
+    if not torch.isfinite(total_weight) or total_weight.item() <= 0:
+        raise ValueError("Loss weights must have a positive finite sum.")
+
+    return ((prediction - target).square() * weight).sum() / total_weight
 
 
 def train_one_epoch(
@@ -446,7 +413,7 @@ def train_one_epoch(
         use_amp: Whether to use automatic mixed precision.
 
     Returns:
-        Average loss per node across all batches.
+        Average weighted loss across all active target values.
 
     Raises:
         ValueError: If a NaN loss is detected.
@@ -456,17 +423,19 @@ def train_one_epoch(
         if use_amp
         else nullcontext()
     )
-    total_loss = 0.0
-    total_nodes = 0
+    total_weighted_error = 0.0
+    total_weight = 0.0
 
     for batch in loader:
         batch = batch.to(device)
         optimizer.zero_grad()
 
         with autocast_ctx:
-            y_pred = model(batch)[:, target_indices]
-            y_true = batch.y[:, target_indices]
-            loss = F.mse_loss(y_pred, y_true, weight=batch.weight)
+            loss_mask = batch.loss_mask
+            y_pred = model(batch)[loss_mask][:, target_indices]
+            y_true = batch.y[loss_mask][:, target_indices]
+            weight = batch.weight[loss_mask]
+            loss = weighted_mse_loss(y_pred, y_true, weight)
 
         if torch.isnan(loss):
             raise ValueError("Loss is NaN. Check data and model for issues.")
@@ -475,10 +444,11 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
 
-        total_loss += loss.item() * batch.num_nodes
-        total_nodes += batch.num_nodes
+        batch_weight = weight.sum().item()
+        total_weighted_error += loss.item() * batch_weight
+        total_weight += batch_weight
 
-    return total_loss / total_nodes
+    return total_weighted_error / total_weight
 
 
 def train_model(
@@ -589,7 +559,7 @@ def save_checkpoint(
 
 def main():
     args = parse_args()
-    model_name = resolve_model_name(args)
+    model_name = args.output_name or "model"
     set_seed(args.seed)
 
     device = torch.device(args.device)
@@ -641,12 +611,12 @@ def main():
             print(f"  {name}: {param.dtype}, shape={list(param.shape)}")
 
     # Optimiser / scheduler / AMP
-    optimizer = build_optimizer(model, args.learning_rate)
-    scheduler = build_scheduler(optimizer)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.998)
     scaler = torch.amp.GradScaler(enabled=device.type == "cuda")
 
     # Directories + TensorBoard
-    checkpoint_dir = args.log_dir / model_name / time.strftime("%Y%m%d-%H%M%S")
+    checkpoint_dir = args.log_dir / time.strftime("%Y%m%d-%H%M%S")
     setup_directories(args, checkpoint_dir)
     writer, log_path = create_tensorboard_writer(args, model_name)
     print(f"Checkpoint directory: {checkpoint_dir}")
