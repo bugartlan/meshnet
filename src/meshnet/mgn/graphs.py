@@ -430,6 +430,11 @@ class GraphVisualizer:
             )
         )
 
+    def compute_von_mises(self, graph: Data) -> torch.Tensor:
+        """Compute von Mises stress from the stress tensor in graph.y."""
+        n_phys = graph.num_physical_nodes
+        return self._compute_von_mises(graph.y)[:n_phys]
+
     @staticmethod
     def _save_html_or_show(plotter: pv.Plotter, save_path: str | Path | None) -> None:
         if save_path is not None:

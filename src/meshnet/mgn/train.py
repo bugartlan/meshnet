@@ -13,7 +13,7 @@ from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
 from meshnet.mgn.nets import EncodeProcessDecode, MeshGraphNet
-from meshnet.mgn.normalizer import LogNormalizer, Normalizer
+from meshnet.mgn.normalizer import GraphNormalizer
 from meshnet.mgn.utils import get_weight
 
 # ---------------------------------------------------------------------------
@@ -61,7 +61,7 @@ class CheckpointConfig:
 
     directory: Path
     model_config: ModelConfig
-    normalizer: Normalizer
+    normalizer: GraphNormalizer
     args: argparse.Namespace
 
 
@@ -189,7 +189,7 @@ def load_graphs_and_params(dataset_name: str) -> tuple[list[Any], dict[str, Any]
     Supports both a single ``.pt`` file and a directory of ``.pt`` files.
 
     Args:
-        dataset_name: Dataset filename stem or folder name under ``data/``.
+        dataset_name: Dataset filename or folder name.
 
     Returns:
         Tuple of (graphs, params dict, resolved dataset path).
@@ -212,7 +212,7 @@ def load_graphs_and_params(dataset_name: str) -> tuple[list[Any], dict[str, Any]
         if params is None:
             raise ValueError(f"# .pt files found in dataset folder: {dataset_path}")
     else:
-        dataset_path = f"{dataset_name}.pt"
+        dataset_path = dataset_name
         loaded = torch.load(dataset_path, weights_only=False)
         graphs = loaded["graphs"]
         params = loaded["params"]
@@ -236,9 +236,9 @@ def get_target_indices(target: str) -> list[int]:
         ValueError: If *target* is not recognised.
     """
     targets: dict[str, list[int]] = {
-        "all": [0, 1, 2, 3, 4, 5, 6, 7, 8],
-        "displacement": [0, 1, 2],
-        "stress": [3, 4, 5, 6, 7, 8],
+        "all": list(range(9)),
+        "displacement": list(range(3)),
+        "stress": list(range(3, 9)),
     }
     if target not in targets:
         raise ValueError(f"Unknown target: {target}")
@@ -280,7 +280,7 @@ def prepare_graphs_fast(
     batch.weight = weights
 
     # 4. Normalize the entire batch in one call
-    batch = normalizer.normalize_batch(batch)
+    batch = normalizer.normalize(batch)
 
     # 5. Explode back into a list of individual graphs for the DataLoader
     graphs_out = batch.to_data_list()
@@ -299,26 +299,17 @@ def prepare_graphs_fast(
 
 
 def build_normalizer(
-    use_log_loss: bool,
-    num_features: int,
-    num_categorical: int,
     device: str = "cpu",
-) -> Normalizer:
-    """Instantiate the appropriate normalizer based on the loss flag.
+) -> GraphNormalizer:
+    """Instantiate the graph normalizer.
 
     Args:
-        use_log_loss: If ``True``, return a ``LogNormalizer``.
-        num_features: Total number of node feature dimensions.
-        num_categorical: Number of categorical (non-normalised) features.
-        device: Compute device for normalizer statistics tensors.
+        device: Compute device for the normalizer buffers.
 
     Returns:
-        An unfitted ``Normalizer`` or ``LogNormalizer``.
+        An unfitted ``GraphNormalizer``.
     """
-    cls = LogNormalizer if use_log_loss else Normalizer
-    return cls(
-        num_features=num_features, num_categorical=num_categorical, device=device
-    )
+    return GraphNormalizer().to(device)
 
 
 def build_model(config: ModelConfig, device: torch.device) -> EncodeProcessDecode:
@@ -339,8 +330,6 @@ def build_model(config: ModelConfig, device: torch.device) -> EncodeProcessDecod
         message_passing_steps=config.message_passing_steps,
         use_layer_norm=config.use_layer_norm,
     ).to(device)
-
-
 
 
 def create_tensorboard_writer(args: argparse.Namespace, subdirectory: str):
@@ -499,15 +488,15 @@ def train_model(
             writer.add_scalar("Loss/train", avg_loss, epoch)
             writer.add_scalar("Learning_Rate", scheduler.get_last_lr()[0], epoch)
 
-        if (epoch + 1) % checkpoint_interval == 0:
-            checkpoint_path = checkpoint_cfg.directory / f"model{epoch + 1}.pth"
-            save_checkpoint(checkpoint_path, model, checkpoint_cfg)
-            print(f"Saved checkpoint at epoch {epoch + 1}: {checkpoint_path}")
-
         if (epoch + 1) % 10 == 0:
             progress_bar.set_description(
                 f"Epoch {epoch + 1:>6}/{num_epochs}, Loss: {avg_loss:.6f}"
             )
+
+        if (epoch + 1) % checkpoint_interval == 0:
+            checkpoint_path = checkpoint_cfg.directory / f"model{epoch + 1}.pth"
+            save_checkpoint(checkpoint_path, model, checkpoint_cfg)
+            print(f"Saved checkpoint at epoch {epoch + 1}: {checkpoint_path}")
 
     return loss_history
 
@@ -536,7 +525,7 @@ def save_checkpoint(
             "model_state_dict": model.state_dict(),
             "params": cfg.model_config.as_checkpoint_dict(),
             "normalizer": cfg.normalizer.__class__.__name__,
-            "stats": cfg.normalizer.stats,
+            "normalizer_state_dict": cfg.normalizer.state_dict(),
             "training_args": {
                 "num_epochs": args.epochs,
                 "learning_rate": args.learning_rate,
@@ -572,9 +561,7 @@ def main():
     )
 
     # Normalizer
-    normalizer = build_normalizer(
-        args.log_loss, params["node_dim"], params["num_categorical"]
-    )
+    normalizer = build_normalizer()
     normalizer.fit(graphs)
 
     # Data

@@ -10,10 +10,8 @@ import torch.nn.functional as F
 
 from meshnet.mgn.graphs import GraphVisualizer
 from meshnet.mgn.nets import EncodeProcessDecode, MeshGraphNet
-from meshnet.mgn.normalizer import LogNormalizer, Normalizer
+from meshnet.mgn.normalizer import GraphNormalizer, LogNormalizer, Normalizer
 from meshnet.mgn.utils import msh_to_trimesh
-
-LABELS = ["x-displacement", "y-displacement", "z-displacement", "Von Mises Stress"]
 
 
 @dataclass
@@ -21,8 +19,9 @@ class PredictionResult:
     """Stores the predicted graph and its evaluation metrics for one sample."""
 
     graph: object
-    loss: float
-    loss75: float
+    mae: float  # mean absolute error
+    rmae: float  # relative mean absolute error
+    pre: float  # peak relative error
 
 
 @dataclass
@@ -71,18 +70,23 @@ def prepare_graphs(graphs: list, normalizer: Normalizer, mode: str = "bottom"):
 # ---------------------------------------------------------------------------
 
 
-def mae75(pred: np.ndarray, true: np.ndarray) -> float:
-    """Mean absolute error restricted to nodes above the 75th-percentile of *true*.
+def evaluate(pred: torch.Tensor, true: torch.Tensor) -> tuple[float, float, float]:
+    """Compute MAE, RMAE, and PRE between predicted and true values.
 
     Args:
         pred: Predicted values.
         true: Ground-truth values.
 
     Returns:
-        Scalar MAE over the top-25 % of ground-truth values.
+        Tuple of (MAE, RMAE, PRE).
     """
-    top = true >= np.percentile(true, 75)
-    return np.abs(pred[top] - true[top]).mean()
+    pred_max = torch.max(torch.abs(pred)).item()
+    true_max = torch.max(torch.abs(true)).item()
+    mae = F.l1_loss(pred, true).item()
+    rmae = mae / true_max
+    pre = (pred_max - true_max) / true_max
+
+    return mae, rmae, pre
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +153,7 @@ def plot(g_true, g_pred, visualizer: GraphVisualizer, mode: str, paths: PlotPath
         render(graph, clim=clim, save_path=out_path)
 
 
-def render_stress(g_true, g_pred, visualizer: GraphVisualizer, paths: PlotPaths):
+def render_von_mises(g_true, g_pred, visualizer: GraphVisualizer, paths: PlotPaths):
     """Render and save ground-truth, prediction, and absolute-error plots.
 
     Args:
@@ -158,11 +162,14 @@ def render_stress(g_true, g_pred, visualizer: GraphVisualizer, paths: PlotPaths)
         visualizer: ``GraphVisualizer`` instance bound to the mesh.
         paths: Output file paths for the three plot files.
     """
+    # Use true von mises to set the color scale for both plots.
+    vm_true = visualizer.compute_von_mises(g_true)
+    clim = (vm_true.min().item(), vm_true.max().item())
     for graph, out_path in (
         (g_true, paths.true),
         (g_pred, paths.pred),
     ):
-        visualizer.stress(graph, save_path=out_path)
+        visualizer.von_mises(graph, clim=clim, save_path=out_path)
 
 
 def render_displacement(g_true, g_pred, visualizer: GraphVisualizer, paths: PlotPaths):
@@ -174,11 +181,14 @@ def render_displacement(g_true, g_pred, visualizer: GraphVisualizer, paths: Plot
         visualizer: ``GraphVisualizer`` instance bound to the mesh.
         paths: Output file paths for the three plot files.
     """
+    # Use true displacement to set the color scale for both plots.
+    vals = torch.linalg.norm(g_true.y[: g_true.num_physical_nodes, :3], dim=1)
+    clim = (vals.min().item(), vals.max().item())
     for graph, out_path in (
         (g_true, paths.true),
         (g_pred, paths.pred),
     ):
-        visualizer.displacement(graph, save_path=out_path)
+        visualizer.displacement(graph, clim=clim, save_path=out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -194,19 +204,12 @@ def build_normalizer(checkpoint: dict, device: torch.device):
         device: Target compute device.
 
     Returns:
-        A fitted ``Normalizer`` or ``LogNormalizer`` instance.
+        A fitted normalizer instance.
     """
-    params = checkpoint["params"]
-    stats = checkpoint["stats"]
-    kwargs = {
-        "num_features": params["node_dim"],
-        "num_categorical": params["num_categorical"],
-        "device": device,
-        "stats": stats,
-    }
-    if checkpoint["normalizer"] == "LogNormalizer":
-        return LogNormalizer(**kwargs)
-    return Normalizer(**kwargs)
+    normalizer = GraphNormalizer()
+    normalizer.load_state_dict(checkpoint["normalizer_state_dict"])
+    normalizer.fitted = True
+    return normalizer.to(device)
 
 
 def get_target_indices(target: str) -> list[int]:
@@ -266,11 +269,10 @@ def run_inference(
             y_true = g.y[loss_mask][:, target_indices]
             y_pred = g_pred.y[loss_mask][:, target_indices]
 
-            loss = F.l1_loss(y_pred, y_true).item()
-            loss75 = mae75(y_pred.cpu().numpy(), y_true.cpu().numpy())
+            mae, rmae, pre = evaluate(y_pred, y_true)
 
             results.append(
-                PredictionResult(graph=g_pred.cpu(), loss=loss, loss75=loss75)
+                PredictionResult(graph=g_pred.cpu(), mae=mae, rmae=rmae, pre=pre)
             )
     elapsed = time.time() - start
 
@@ -319,12 +321,12 @@ def save_plots(
         true = graphs[i].cpu()
         pred = results[i].graph
         if fields == "displacement":
-            render_displacement(true, pred, visualizer, _make_paths(f"#{i}"))
+            render_displacement(true, pred, visualizer, _make_paths(f"#{i}_disp"))
         else:
-            render_stress(true, pred, visualizer, _make_paths(f"#{i}"))
+            render_von_mises(true, pred, visualizer, _make_paths(f"#{i}_vm"))
         print(
             f"Saved plot (sample {i}, {filepath.stem}): "
-            f"loss={results[i].loss:.6f}, loss75={results[i].loss75:.6f}."
+            f"mae={results[i].mae:.6f}, rmae={results[i].rmae:.6f}%, pre={results[i].pre:.6f}%."
         )
 
 
@@ -437,12 +439,14 @@ def main():
 
     # Aggregate metrics
     n = len(results)
-    avg_loss = sum(r.loss for r in results) / n
-    avg_loss75 = sum(r.loss75 for r in results) / n
+    avg_mae = sum(r.mae for r in results) / n
+    avg_rmae = sum(r.rmae for r in results) / n
+    avg_pre = sum(r.pre for r in results) / n
 
     print("Results:")
-    print(f"  Avg L1 loss:              {avg_loss:.6f}")
-    print(f"  Avg L1 loss (75th pct):   {avg_loss75:.6f}")
+    print(f"  Avg L1 loss:              {avg_mae:.6f}")
+    print(f"  Avg relative L1 loss:     {avg_rmae:.6f}%")
+    print(f"  Avg relative peak error:  {avg_pre:.6f}%")
 
     # Optionally save visualisation plots
     if args.plots:
@@ -450,7 +454,14 @@ def main():
             msh_to_trimesh(meshio.read(msh_path)), jupyter_backend=False
         )
         save_plots(
-            results, graphs, msh_path, visualizer, args.mode, args.plot_dir, args.n
+            results,
+            graphs,
+            msh_path,
+            visualizer,
+            args.mode,
+            args.plot_dir,
+            args.n,
+            fields=args.target,
         )
 
 

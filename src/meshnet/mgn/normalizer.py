@@ -1,4 +1,5 @@
 import torch
+from torch import nn
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
@@ -9,9 +10,9 @@ def _physical_node_mask(batch: Data) -> torch.Tensor:
     counts = torch.as_tensor(
         batch.num_physical_nodes, device=batch.x.device, dtype=torch.long
     ).flatten()
-    local_indices = torch.arange(batch.num_nodes, device=batch.x.device) - batch.ptr[
-        batch.batch
-    ]
+    local_indices = (
+        torch.arange(batch.num_nodes, device=batch.x.device) - batch.ptr[batch.batch]
+    )
     return local_indices < counts[batch.batch]
 
 
@@ -21,7 +22,7 @@ class Normalizer:
         num_features: int,
         num_categorical: int = 1,
         device: str = "cpu",
-        stats: dict = None,
+        stats: dict | None = None,
     ):
         self.num_features = num_features
         self.device = device
@@ -205,9 +206,7 @@ class LogNormalizer(Normalizer):
         all_pos = torch.cat([g.x[:, :3] for g in graphs], dim=0)
         all_edge = torch.cat([g.edge_attr for g in graphs], dim=0)
 
-        all_y_raw = torch.cat(
-            [g.y[: int(g.num_physical_nodes)] for g in graphs], dim=0
-        )
+        all_y_raw = torch.cat([g.y[: int(g.num_physical_nodes)] for g in graphs], dim=0)
         all_disp = all_y_raw[:, :3]  # x, y, z displacements
         all_stress = all_y_raw[:, 3:]
         all_stress_log = self._log_stress(all_stress)
@@ -232,3 +231,191 @@ class LogNormalizer(Normalizer):
         log_y = super().denormalize_y(y)
         log_y[:, 3:] = self._exp_stress(log_y[:, 3:])
         return log_y
+
+
+def get_physical_node_mask(batch: Data) -> torch.Tensor:
+    """Returns a boolean mask selecting physical nodes (excluding virtual ones)."""
+    if hasattr(batch, "is_virtual"):
+        return batch.is_virtual == 0
+    elif hasattr(batch, "num_physical_nodes"):
+        counts = torch.as_tensor(
+            batch.num_physical_nodes, device=batch.x.device, dtype=torch.long
+        ).flatten()
+        local_indices = (
+            torch.arange(batch.num_nodes, device=batch.x.device)
+            - batch.ptr[batch.batch]
+        )
+        return local_indices < counts[batch.batch]
+    return torch.ones(batch.num_nodes, dtype=torch.bool, device=batch.x.device)
+
+
+class GraphNormalizer(nn.Module):
+    """Normalizes Graph Neural Network inputs and outputs for 3D mechanics problems.
+
+    Node Features: [x, y, z, fx, fy, fz, is_boundary, is_virtual]
+    Edge Features: [dx, dy, dz, distance]
+    Output Features: [dx', dy', dz', sx, sy, sz, txy, txz, tyz]
+    """
+
+    def __init__(self, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+
+        # Persistent normalization statistics
+        self.register_buffer("pos_mean", torch.zeros(3))
+        self.register_buffer("pos_std", torch.ones(3))
+
+        self.register_buffer("force_max", torch.tensor(1.0))
+
+        self.register_buffer("edge_mean", torch.zeros(4))
+        self.register_buffer("edge_std", torch.ones(4))
+
+        self.register_buffer("disp_mean", torch.zeros(3))
+        self.register_buffer("disp_std", torch.ones(3))
+
+        self.register_buffer("stress_log_mean", torch.zeros(6))
+        self.register_buffer("stress_log_std", torch.ones(6))
+
+        self.fitted = False
+
+    @staticmethod
+    def _symlog(x: torch.Tensor) -> torch.Tensor:
+        """Symmetric log transform: preserves sign, compresses large magnitudes."""
+        return torch.sign(x) * torch.log1p(torch.abs(x))
+
+    @staticmethod
+    def _symexp(x: torch.Tensor) -> torch.Tensor:
+        """Inverse symmetric log transform."""
+        return torch.sign(x) * torch.expm1(torch.abs(x))
+
+    @torch.no_grad()
+    def fit(self, dataset: list[Data], batch_size: int = 64, num_workers: int = 4):
+        """Computes means and standard deviations across the dataset using Welford's algorithm."""
+        loader = DataLoader(
+            dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
+        )
+
+        # Running accumulators for Welford's algorithm
+        pos_count, pos_m, pos_m2 = 0, torch.zeros(3), torch.zeros(3)
+        edge_count, edge_m, edge_m2 = 0, torch.zeros(4), torch.zeros(4)
+        disp_count, disp_m, disp_m2 = 0, torch.zeros(3), torch.zeros(3)
+        stress_count, stress_m, stress_m2 = 0, torch.zeros(6), torch.zeros(6)
+
+        max_force = 0.0
+
+        for batch in tqdm(loader, desc="Fitting Normalizer"):
+            # 1. Spatial Positions [x, y, z]
+            pos = batch.x[:, :3].cpu()
+            pos_count, pos_m, pos_m2 = self._welford_update(
+                pos, pos_count, pos_m, pos_m2
+            )
+
+            # 2. Maximum Applied Force Magnitude
+            forces = batch.x[:, 3:6].abs().max().item()
+            max_force = max(max_force, forces)
+
+            # 3. Edge Features [dx, dy, dz, distance]
+            edges = batch.edge_attr.cpu()
+            edge_count, edge_m, edge_m2 = self._welford_update(
+                edges, edge_count, edge_m, edge_m2
+            )
+
+            # 4. Target Features (Physical nodes only)
+            if hasattr(batch, "y") and batch.y is not None:
+                mask = get_physical_node_mask(batch).cpu()
+                y_phys = batch.y[mask].cpu()
+
+                disp = y_phys[:, :3]
+                stress_log = self._symlog(y_phys[:, 3:9])
+
+                disp_count, disp_m, disp_m2 = self._welford_update(
+                    disp, disp_count, disp_m, disp_m2
+                )
+                stress_count, stress_m, stress_m2 = self._welford_update(
+                    stress_log, stress_count, stress_m, stress_m2
+                )
+
+        # Store calculated statistics
+        self.pos_mean.copy_(pos_m)
+        self.pos_std.copy_(
+            torch.sqrt(pos_m2 / max(pos_count - 1, 1)).clamp_min(self.eps)
+        )
+
+        self.force_max.copy_(torch.tensor(max_force if max_force > 0 else 1.0))
+
+        self.edge_mean.copy_(edge_m)
+        self.edge_std.copy_(
+            torch.sqrt(edge_m2 / max(edge_count - 1, 1)).clamp_min(self.eps)
+        )
+
+        if disp_count > 0:
+            self.disp_mean.copy_(disp_m)
+            self.disp_std.copy_(
+                torch.sqrt(disp_m2 / max(disp_count - 1, 1)).clamp_min(self.eps)
+            )
+
+            self.stress_log_mean.copy_(stress_m)
+            self.stress_log_std.copy_(
+                torch.sqrt(stress_m2 / max(stress_count - 1, 1)).clamp_min(self.eps)
+            )
+
+        self.fitted = True
+
+    @staticmethod
+    def _welford_update(
+        x: torch.Tensor, count: int, mean: torch.Tensor, M2: torch.Tensor
+    ):
+        """Numerically stable online update for mean and variance (Welford's algorithm)."""
+        n = x.size(0)
+        if n == 0:
+            return count, mean, M2
+
+        new_count = count + n
+        x_mean = x.mean(dim=0)
+        delta = x_mean - mean
+        new_mean = mean + delta * (n / new_count)
+
+        # Sum of squared differences from the mean
+        M2_x = ((x - x_mean) ** 2).sum(dim=0)
+        new_M2 = M2 + M2_x + (delta**2) * (count * n / new_count)
+
+        return new_count, new_mean, new_M2
+
+    def normalize(self, data: Data) -> Data:
+        """Normalizes a PyG Data or Batch object (creates a clone)."""
+        out = data.clone()
+
+        # 1. Node features: [x, y, z] -> Z-score
+        out.x[:, :3] = (out.x[:, :3] - self.pos_mean) / self.pos_std
+
+        # 2. Node features: [fx, fy, fz] -> Max scaling
+        out.x[:, 3:6] = out.x[:, 3:6] / self.force_max
+
+        # 3. Node flags [is_boundary, is_virtual] remain untouched (0 or 1)
+
+        # 4. Edge features -> Z-score
+        out.edge_attr = (out.edge_attr - self.edge_mean) / self.edge_std
+
+        # 5. Targets [dx, dy, dz, stress...]
+        if hasattr(out, "y") and out.y is not None:
+            disp_norm = (out.y[:, :3] - self.disp_mean) / self.disp_std
+            stress_log = self._symlog(out.y[:, 3:9])
+            stress_norm = (stress_log - self.stress_log_mean) / self.stress_log_std
+
+            out.y = torch.cat([disp_norm, stress_norm], dim=-1)
+
+        return out
+
+    def denormalize_y(self, y_pred: torch.Tensor) -> torch.Tensor:
+        """Converts model predictions back to physical units (meters and Pascals)."""
+        disp_pred = y_pred[:, :3]
+        stress_pred = y_pred[:, 3:9]
+
+        # Invert Z-score scaling
+        disp_physical = (disp_pred * self.disp_std) + self.disp_mean
+        stress_log = (stress_pred * self.stress_log_std) + self.stress_log_mean
+
+        # Invert symmetric log
+        stress_physical = self._symexp(stress_log)
+
+        return torch.cat([disp_physical, stress_physical], dim=-1)
