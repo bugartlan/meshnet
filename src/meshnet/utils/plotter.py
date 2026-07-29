@@ -33,14 +33,14 @@ def plot_grasp(obj: Mesh, grasp: Grasp, gripper):
 
     # Visualize contact points
     radius = RADIUS * scale
-    c1_sphere = trimesh.creation.uv_sphere(radius=radius)
+    c1_sphere = trimesh.creation.icosphere(radius=radius)
     c1_sphere.visual.face_colors = COLOR_RED
     scene.add_geometry(
         c1_sphere,
         transform=trimesh.transformations.translation_matrix(grasp.c1.pos),
     )
 
-    c2_sphere = trimesh.creation.uv_sphere(radius=radius)
+    c2_sphere = trimesh.creation.icosphere(radius=radius)
     c2_sphere.visual.face_colors = COLOR_RED
     scene.add_geometry(
         c2_sphere,
