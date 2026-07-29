@@ -456,12 +456,11 @@ class GraphVisualizer:
         debug: bool = False,
     ):
         """Unified plotting pipeline for scalar or vector fields on graph nodes."""
-        self.pv_mesh.point_data[field_name] = field_data
+        pv_mesh = self.pv_mesh.copy()
+        pv_mesh.point_data[field_name] = field_data
 
         if clip_bottom:
             pv_mesh = self.pv_mesh.clip(normal=(0, 0, 1), origin=(0, 0, 1e-6))
-        else:
-            pv_mesh = self.pv_mesh
 
         # Configure PyVista plotter
         plotter = pv.Plotter(notebook=self.jupyter_backend)
@@ -509,7 +508,7 @@ class GraphVisualizer:
         return self.plot_field(
             graph=graph,
             field_data=vm,
-            field_name="von_mises",
+            field_name="von Mises [Pa]",
             save_path=save_path,
             cmap=cmap,
             clim=clim,
@@ -527,14 +526,16 @@ class GraphVisualizer:
         show_contacts: bool = False,
         save_path: str | Path | None = None,
         scalar_bar_args: dict | None = None,
+        scale: float = 1e9,
         debug: bool = False,
     ):
         n_phys = graph.num_physical_nodes
-        disp = graph.y.detach().cpu().numpy()[:n_phys, :3]
+        clim = (clim[0] * scale, clim[1] * scale) if clim is not None else None
+        disp = graph.y.detach().cpu().numpy()[:n_phys, :3] * scale
         return self.plot_field(
             graph=graph,
             field_data=disp,
-            field_name="displacement",
+            field_name=f"displacement [{1 / scale:.1e} m]",
             save_path=save_path,
             cmap=cmap,
             clim=clim,

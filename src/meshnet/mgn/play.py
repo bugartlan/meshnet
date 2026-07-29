@@ -1,7 +1,9 @@
 import argparse
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import meshio
 import numpy as np
@@ -184,9 +186,10 @@ def render_displacement(g_true, g_pred, visualizer: GraphVisualizer, paths: Plot
     # Use true displacement to set the color scale for both plots.
     vals = torch.linalg.norm(g_true.y[: g_true.num_physical_nodes, :3], dim=1)
     clim = (vals.min().item(), vals.max().item())
+
     for graph, out_path in (
-        (g_true, paths.true),
         (g_pred, paths.pred),
+        (g_true, paths.true),
     ):
         visualizer.displacement(graph, clim=clim, save_path=out_path)
 
@@ -284,50 +287,109 @@ def run_inference(
 # ---------------------------------------------------------------------------
 
 
-def save_plots(
-    results: list[PredictionResult],
-    graphs: list,
-    filepath: Path,
+def save_prediction_visualizations(
+    results: Sequence[PredictionResult],
+    graphs: Sequence,
+    source_path: Path,
     visualizer: GraphVisualizer,
     mode: str,
-    directory: Path,
-    n_random: int = 1,
-    fields: str = "displacement",
+    output_dir: Path,
+    random_sample_count: int = 1,
+    field: Literal["displacement", "von_mises"] = "displacement",
 ) -> None:
-    """Save plots for *n_random* random samples.
+    """Save visualizations for the best and worst prediction and randomly selected samples.
+
+    The worst prediction is the sample with the highest relative mean absolute
+    error (RMAE). Plot files are written as HTML files in ``output_dir``.
 
     Args:
-        results: Per-sample prediction results from ``run_inference``.
-        graphs: Un-normalised ground-truth graphs (CPU tensors).
-        filepath: Path to the source mesh file (stem used in filenames).
-        visualizer: ``GraphVisualizer`` bound to the loaded mesh.
-        mode: ``"bottom"`` or ``"all"``.
-        directory: Directory where HTML plot files are written.
-        n_random: Number of random samples to visualize.
-        fields: List of field names to include in the plots.
+        results: Prediction metrics and predicted graphs for each sample.
+        graphs: Unnormalized ground-truth graphs corresponding to ``results``.
+        source_path: Source mesh path. Its stem is used in output filenames.
+        visualizer: Visualizer configured for the source mesh.
+        mode: Visualization mode. ``"bottom"`` adds a ``"_bottom"`` suffix.
+        output_dir: Directory in which to save the generated HTML files.
+        random_sample_count: Maximum number of random samples to visualize.
+        field: Physical field to visualize.
+
+    Raises:
+        ValueError: If ``results`` is empty or its length differs from ``graphs``.
     """
-    suffix = "_bottom" if mode == "bottom" else ""
+    filename_suffix = "_b" if mode == "bottom" else ""
+    field_suffix = "disp" if field == "displacement" else "vm"
 
-    def _make_paths(tag: str) -> PlotPaths:
+    def build_plot_paths(sample_tag: str) -> PlotPaths:
+        filename_prefix = f"{source_path.stem}_{sample_tag}"
+
         return PlotPaths(
-            true=directory / f"{filepath.stem}_{tag}_true{suffix}.html",
-            pred=directory / f"{filepath.stem}_{tag}_pred{suffix}.html",
-            error=directory / f"{filepath.stem}_{tag}_error{suffix}.html",
+            true=output_dir / f"{filename_prefix}_true{filename_suffix}.html",
+            pred=output_dir / f"{filename_prefix}_pred{filename_suffix}.html",
+            error=output_dir / f"{filename_prefix}_error{filename_suffix}.html",
         )
 
-    n_random = min(n_random, len(results))
-    print(f"Generating {n_random} random plots in {directory}...")
-    for i in np.random.choice(len(results), size=n_random, replace=False):
-        true = graphs[i].cpu()
-        pred = results[i].graph
-        if fields == "displacement":
-            render_displacement(true, pred, visualizer, _make_paths(f"#{i}_disp"))
+    def save_sample(sample_index: int, label: str) -> None:
+        result = results[sample_index]
+        ground_truth = graphs[sample_index].cpu()
+        paths = build_plot_paths(f"{label}_{sample_index}_{field_suffix}")
+
+        if field == "displacement":
+            render_displacement(
+                ground_truth,
+                result.graph,
+                visualizer,
+                paths,
+            )
         else:
-            render_von_mises(true, pred, visualizer, _make_paths(f"#{i}_vm"))
+            render_von_mises(
+                ground_truth,
+                result.graph,
+                visualizer,
+                paths,
+            )
+
         print(
-            f"Saved plot (sample {i}, {filepath.stem}): "
-            f"mae={results[i].mae:.6f}, rmae={results[i].rmae:.6f}%, pre={results[i].pre:.6f}%."
+            f"Saved {label} prediction visualization "
+            f"(sample={sample_index}, mesh={source_path.stem}, "
+            f"mae={result.mae:.6f}, "
+            f"rmae={result.rmae:.2%}, "
+            f"pre={result.pre:.2%})."
         )
+
+    # Save the sample with the highest relative error.
+    worst_sample_index = max(
+        range(len(results)),
+        key=lambda index: results[index].rmae,
+    )
+    save_sample(worst_sample_index, label="worst")
+
+    # Save the sample with the lowest relative error.
+    best_sample_index = min(
+        range(len(results)),
+        key=lambda index: results[index].rmae,
+    )
+    save_sample(best_sample_index, label="best")
+
+    # Save a non-repeating random subset of the remaining samples.
+    candidate_indices = [
+        index for index in range(len(results)) if index != worst_sample_index
+    ]
+    sample_count = min(random_sample_count, len(candidate_indices))
+
+    if sample_count == 0:
+        return
+
+    print(
+        f"Generating {sample_count} random prediction visualizations in {output_dir}."
+    )
+
+    random_indices = np.random.choice(
+        candidate_indices,
+        size=sample_count,
+        replace=False,
+    )
+
+    for sample_index in random_indices:
+        save_sample(int(sample_index), label="random")
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +434,7 @@ def parse_args():
     p.add_argument(
         "-n",
         type=int,
-        default=1,
+        default=0,
         help="Number of random samples to visualize.",
     )
     p.add_argument(
@@ -444,24 +506,24 @@ def main():
     avg_pre = sum(r.pre for r in results) / n
 
     print("Results:")
-    print(f"  Avg L1 loss:              {avg_mae:.6f}")
-    print(f"  Avg relative L1 loss:     {avg_rmae:.6f}%")
-    print(f"  Avg relative peak error:  {avg_pre:.6f}%")
+    print(f"  Avg L1 loss:              {avg_mae:.1f}")
+    print(f"  Avg relative L1 loss:     {100 * avg_rmae:.1f}%")
+    print(f"  Avg relative peak error:  {100 * avg_pre:.1f}%")
 
     # Optionally save visualisation plots
     if args.plots:
         visualizer = GraphVisualizer(
             msh_to_trimesh(meshio.read(msh_path)), jupyter_backend=False
         )
-        save_plots(
+        save_prediction_visualizations(
             results,
             graphs,
             msh_path,
             visualizer,
             args.mode,
             args.plot_dir,
-            args.n,
-            fields=args.target,
+            random_sample_count=args.n,
+            field=args.target,
         )
 
 
