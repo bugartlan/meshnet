@@ -21,7 +21,7 @@ from meshnet.mgn.utils import get_weight
 # ---------------------------------------------------------------------------
 
 
-LATENT_DIM = 128
+LATENT_DIM = 256
 USE_LAYER_NORM = True
 
 
@@ -322,7 +322,7 @@ def build_model(config: ModelConfig, device: torch.device) -> EncodeProcessDecod
     Returns:
         Initialised model in training mode.
     """
-    return EncodeProcessDecode(
+    return MeshGraphNet(
         node_dim=config.node_dim,
         edge_dim=config.edge_dim,
         output_dim=config.output_dim,
@@ -356,29 +356,23 @@ def create_tensorboard_writer(args: argparse.Namespace, subdirectory: str):
 
 
 def weighted_mse_loss(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-    weight: torch.Tensor,
+    pred: torch.Tensor, true: torch.Tensor, weight: torch.Tensor
 ) -> torch.Tensor:
-    """Return ``sum(weight * squared_error) / sum(weight)``.
+    return ((pred - true).square() * weight).sum() / weight.sum()
 
-    An explicit reduction makes zero-weight masking independent of PyTorch's
-    built-in loss reduction semantics and keeps the scale invariant to the
-    number of virtual nodes.
-    """
-    if prediction.shape != target.shape or weight.shape != prediction.shape:
-        raise ValueError(
-            "prediction, target, and weight must have identical shapes; got "
-            f"{prediction.shape}, {target.shape}, and {weight.shape}."
-        )
-    if torch.any(weight < 0):
-        raise ValueError("Loss weights must be non-negative.")
 
-    total_weight = weight.sum()
-    if not torch.isfinite(total_weight) or total_weight.item() <= 0:
-        raise ValueError("Loss weights must have a positive finite sum.")
+def edge_gradient_loss(
+    pred: torch.Tensor, true: torch.Tensor, edge_index: torch.Tensor
+) -> torch.Tensor:
+    src, dst = edge_index
 
-    return ((prediction - target).square() * weight).sum() / total_weight
+    pred_difference = pred[src] - pred[dst]
+    true_difference = true[src] - true[dst]
+
+    return torch.nn.functional.mse_loss(
+        pred_difference,
+        true_difference,
+    )
 
 
 def train_one_epoch(
@@ -424,7 +418,15 @@ def train_one_epoch(
             y_pred = model(batch)[loss_mask][:, target_indices]
             y_true = batch.y[loss_mask][:, target_indices]
             weight = batch.weight[loss_mask]
-            loss = weighted_mse_loss(y_pred, y_true, weight)
+
+            src, dst = batch.edge_index
+            edge_mask = loss_mask[src] & loss_mask[dst]
+
+            loss_field = weighted_mse_loss(y_pred, y_true, weight)
+            loss_edge = edge_gradient_loss(
+                y_pred, y_true, batch.edge_index[:, edge_mask]
+            )
+            loss = loss_field + 1.0 * loss_edge
 
         if torch.isnan(loss):
             raise ValueError("Loss is NaN. Check data and model for issues.")

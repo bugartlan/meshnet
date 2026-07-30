@@ -133,9 +133,7 @@ class Simulator:
             tuple[str, int, tuple[int, ...]], _ProjectionSystem
         ] = {}
         self._dof_trees: dict[int, tuple[Any, KDTree]] = {}
-        self._mesh_points = np.asarray(
-            obj_mesh.volume.points, dtype=np.float64
-        ).copy()
+        self._mesh_points = np.asarray(obj_mesh.volume.points, dtype=np.float64).copy()
         (
             self._mesh_evaluation_points,
             self._mesh_evaluation_cells,
@@ -326,9 +324,20 @@ class Simulator:
         )
 
     def compute_stress(self, displacement: fem.Function, degree: int) -> fem.Function:
-        """Project stress onto a discontinuous space."""
+        """Project stress onto a continuous Lagrange space.
+
+        A continuous projection gives each mesh vertex one unambiguous stress
+        value. This is required for node-based graph targets: evaluating a
+        discontinuous stress field at a shared vertex otherwise selects an
+        arbitrary adjacent cell's value.
+        """
         sigma_voigt = self.stress_voigt(displacement)
-        return self._project(sigma_voigt, family="DG", degree=degree, shape=(6,))
+        return self._project(
+            sigma_voigt,
+            family="Lagrange",
+            degree=degree,
+            shape=(6,),
+        )
 
     def _colliding_cell_indices(
         self, points: np.ndarray
@@ -373,8 +382,8 @@ class Simulator:
 
         missing_indices = np.flatnonzero(evaluation_cells < 0)
         if missing_indices.size:
-            projected_indices, projected_points, projected_cells = (
-                self._project_inside(self._mesh_points[missing_indices])
+            projected_indices, projected_points, projected_cells = self._project_inside(
+                self._mesh_points[missing_indices]
             )
             resolved_indices = missing_indices[projected_indices]
             evaluation_points[resolved_indices] = projected_points
@@ -453,11 +462,7 @@ class Simulator:
             self._dof_trees[key] = cached
         return cached[1]
 
-    def evaluate_mesh_points(
-        self,
-        function: fem.Function,
-        clip: bool = True,
-    ) -> np.ndarray:
+    def evaluate_mesh_points(self, function: fem.Function) -> np.ndarray:
         """Evaluate a function at the volume-mesh points using cached cells.
 
         The geometric search is performed once when the simulator is created.
@@ -490,8 +495,6 @@ class Simulator:
             nodal_values = function.x.array.real.reshape(-1, block_size)
             values[missing_indices] = nodal_values[cached[1]]
 
-        if clip:
-            np.maximum(values, 0.0, out=values)
         return values
 
     def probe(

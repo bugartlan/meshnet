@@ -86,7 +86,7 @@ def evaluate(pred: torch.Tensor, true: torch.Tensor) -> tuple[float, float, floa
     true_max = torch.max(torch.abs(true)).item()
     mae = F.l1_loss(pred, true).item()
     rmae = mae / true_max
-    pre = (pred_max - true_max) / true_max
+    pre = abs(pred_max - true_max) / true_max
 
     return mae, rmae, pre
 
@@ -482,7 +482,7 @@ def main():
     normalized_graphs = prepare_graphs(graphs, normalizer, args.mode)
     target_indices = get_target_indices(args.target)
 
-    model = EncodeProcessDecode(
+    model = MeshGraphNet(
         node_dim=params["node_dim"],
         edge_dim=params["edge_dim"],
         output_dim=params["output_dim"],

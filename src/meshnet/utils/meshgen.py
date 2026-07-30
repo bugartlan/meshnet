@@ -129,7 +129,7 @@ def parse_args():
     parser.add_argument(
         "--output", type=Path, default=Path("meshes"), help="Output directory"
     )
-    parser.add_argument("--size", type=float, default=0.005, help="Mesh element size")
+    parser.add_argument("--size", type=float, default=0.002, help="Mesh element size")
     parser.add_argument(
         "--target-scale",
         type=float,
