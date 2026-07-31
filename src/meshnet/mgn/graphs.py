@@ -10,6 +10,8 @@ from torch_geometric.data import Data
 
 from meshnet.mgn.geodesics import SurfaceGeodesics
 
+pv.OFF_SCREEN = True
+
 
 class GraphBuilderBase:
     """Base class for constructing geometric graphs from finite element meshes and simulation data.
@@ -433,7 +435,8 @@ class GraphVisualizer:
     def compute_von_mises(self, graph: Data) -> torch.Tensor:
         """Compute von Mises stress from the stress tensor in graph.y."""
         n_phys = graph.num_physical_nodes
-        return self._compute_von_mises(graph.y)[:n_phys]
+        stress = graph.y[:n_phys, 3:9]
+        return self._compute_von_mises(stress)
 
     @staticmethod
     def _save_html_or_show(plotter: pv.Plotter, save_path: str | Path | None) -> None:
@@ -463,7 +466,7 @@ class GraphVisualizer:
             pv_mesh = self.pv_mesh.clip(normal=(0, 0, 1), origin=(0, 0, 1e-6))
 
         # Configure PyVista plotter
-        plotter = pv.Plotter(notebook=self.jupyter_backend)
+        plotter = pv.Plotter(notebook=self.jupyter_backend, off_screen=True)
         plotter.add_mesh(
             pv_mesh,
             scalars=field_name,
@@ -504,7 +507,8 @@ class GraphVisualizer:
         debug: bool = False,
     ):
         n_phys = graph.num_physical_nodes
-        vm = self._compute_von_mises(graph.y).detach().cpu().numpy()[:n_phys]
+        stress = graph.y[:n_phys, 3:9]
+        vm = self._compute_von_mises(stress).detach().cpu().numpy()
         return self.plot_field(
             graph=graph,
             field_data=vm,

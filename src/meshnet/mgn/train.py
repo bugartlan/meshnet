@@ -402,7 +402,7 @@ def train_one_epoch(
         ValueError: If a NaN loss is detected.
     """
     autocast_ctx = (
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        torch.autocast(device_type="cuda", dtype=torch.float16)
         if use_amp
         else nullcontext()
     )
@@ -421,11 +421,12 @@ def train_one_epoch(
 
             src, dst = batch.edge_index
             edge_mask = loss_mask[src] & loss_mask[dst]
+            remap = torch.full((batch.num_nodes,), -1, dtype=torch.long, device=device)
+            remap[loss_mask] = torch.arange(int(loss_mask.sum()), device=device)
+            local_edge_index = remap[batch.edge_index[:, edge_mask]]
 
             loss_field = weighted_mse_loss(y_pred, y_true, weight)
-            loss_edge = edge_gradient_loss(
-                y_pred, y_true, batch.edge_index[:, edge_mask]
-            )
+            loss_edge = edge_gradient_loss(y_pred, y_true, local_edge_index)
             loss = loss_field + 1.0 * loss_edge
 
         if torch.isnan(loss):
