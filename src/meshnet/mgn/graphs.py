@@ -9,7 +9,8 @@ import torch
 import trimesh
 from torch_geometric.data import Data
 
-from meshnet.mgn.geodesics import SurfaceGeodesics
+from meshnet.utils.geodesics import SurfaceGeodesics
+from meshnet.utils.math import calculate_von_mises
 from meshnet.utils.mesh import Mesh
 
 pv.OFF_SCREEN = True
@@ -466,27 +467,6 @@ class GraphVisualizer:
             plotter.add_mesh(arrow, color="red")
 
     @staticmethod
-    def _compute_von_mises(tensor: torch.Tensor) -> torch.Tensor:
-        s_xx, s_yy, s_zz = tensor[:, 0], tensor[:, 1], tensor[:, 2]
-        t_xy, t_yz, t_zx = tensor[:, 3], tensor[:, 4], tensor[:, 5]
-
-        return torch.sqrt(
-            0.5
-            * (
-                (s_xx - s_yy) ** 2
-                + (s_yy - s_zz) ** 2
-                + (s_zz - s_xx) ** 2
-                + 6 * (t_xy**2 + t_yz**2 + t_zx**2)
-            )
-        )
-
-    def compute_von_mises(self, graph: Data) -> torch.Tensor:
-        """Compute von Mises stress from the stress tensor in graph.y."""
-        n_phys = graph.num_physical_nodes
-        stress = graph.y[:n_phys, 3:9]
-        return self._compute_von_mises(stress)
-
-    @staticmethod
     def _save_html_or_show(plotter: pv.Plotter, save_path: str | Path | None) -> None:
         if save_path is not None:
             plotter.export_html(str(save_path))
@@ -556,7 +536,7 @@ class GraphVisualizer:
     ):
         n_phys = graph.num_physical_nodes
         stress = graph.y[:n_phys, 3:9]
-        vm = self._compute_von_mises(stress).detach().cpu().numpy()
+        vm = calculate_von_mises(stress).detach().cpu().numpy()
         return self.plot_field(
             graph=graph,
             field_data=vm,

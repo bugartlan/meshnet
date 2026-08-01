@@ -12,8 +12,10 @@ import torch.nn.functional as F
 
 from meshnet.mgn.graphs import GraphVisualizer
 from meshnet.mgn.nets import EncodeProcessDecode, MeshGraphNet
-from meshnet.mgn.normalizer import GraphNormalizer, LogNormalizer, Normalizer
+from meshnet.mgn.normalizer import GraphNormalizer, LogNormalizer
 from meshnet.mgn.utils import msh_to_trimesh
+from meshnet.utils.geodesics import SurfaceGeodesics
+from meshnet.utils.math import calculate_von_mises
 
 
 @dataclass
@@ -21,9 +23,13 @@ class PredictionResult:
     """Stores the predicted graph and its evaluation metrics for one sample."""
 
     graph: object
-    mae: float  # mean absolute error
-    rmae: float  # relative mean absolute error
-    pre: float  # peak relative error
+
+    # Error metrics
+    loss_l1: float
+    loss_rel_l1: float
+    loss_top1_rel_l1: float
+    loss_peak_rel: float
+    loss_peak_loc: float
 
 
 @dataclass
@@ -40,7 +46,7 @@ class PlotPaths:
 # ---------------------------------------------------------------------------
 
 
-def prepare_graphs(graphs: list, normalizer: Normalizer, mode: str = "bottom"):
+def prepare_graphs(graphs: list, normalizer, mode: str = "bottom"):
     """Normalize graphs and create loss masks.
 
     Args:
@@ -72,23 +78,47 @@ def prepare_graphs(graphs: list, normalizer: Normalizer, mode: str = "bottom"):
 # ---------------------------------------------------------------------------
 
 
-def evaluate(pred: torch.Tensor, true: torch.Tensor) -> tuple[float, float, float]:
-    """Compute MAE, RMAE, and PRE between predicted and true values.
+def evaluate(
+    pred: torch.Tensor, true: torch.Tensor, geodesics: SurfaceGeodesics
+) -> tuple[float, float, float, float, float]:
+    """Compute error metrics between predicted and ground-truth values.
 
     Args:
         pred: Predicted values.
         true: Ground-truth values.
+        geodesics: Geodesic solver for the underlying surface mesh.
 
     Returns:
-        Tuple of (MAE, RMAE, PRE).
+        Tuple of (L1 loss, relative L1 loss, top 1% relative L1 loss, peak relative error, peak location relative error).
     """
+
+    # L1 loss (mean absolute error)
+    loss_l1 = F.l1_loss(pred, true, reduction="mean").item()
+    loss_rel_l1 = (torch.abs(pred - true) / (torch.abs(true) + 1e-9)).mean().item()
+
+    # Top 1% relative L1 loss: mean realtive error over nodes above tthe 99th percentile of true
+    threshold = torch.quantile(torch.abs(true), 0.99)
+    mask = torch.abs(true) >= threshold
+    loss_top1_rel_l1 = (
+        (torch.abs(pred[mask] - true[mask]) / (torch.abs(true[mask]) + 1e-9))
+        .mean()
+        .item()
+    )
+
+    # Peak relative error: relative error of the maximum absolute value
     pred_max = torch.max(torch.abs(pred)).item()
     true_max = torch.max(torch.abs(true)).item()
-    mae = F.l1_loss(pred, true).item()
-    rmae = mae / true_max
-    pre = abs(pred_max - true_max) / true_max
+    loss_peak_rel = abs(pred_max - true_max) / (true_max + 1e-9)
 
-    return mae, rmae, pre
+    # Peak location relative error: geodesic distance between the locations of the maximum absolute value
+    values_per_vertex = pred.shape[-1] if pred.ndim > 1 else 1
+    pred_max_idx = torch.argmax(torch.abs(pred)).item() // values_per_vertex
+    true_max_idx = torch.argmax(torch.abs(true)).item() // values_per_vertex
+    loss_peak_loc = geodesics.distance_from(geodesics.vertices[true_max_idx])[
+        pred_max_idx
+    ]
+
+    return (loss_l1, loss_rel_l1, loss_top1_rel_l1, loss_peak_rel, loss_peak_loc)
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +195,8 @@ def render_von_mises(g_true, g_pred, visualizer: GraphVisualizer, paths: PlotPat
         paths: Output file paths for the three plot files.
     """
     # Use true von mises to set the color scale for both plots.
-    vm_true = visualizer.compute_von_mises(g_true)
+    stress = g_true.y[: g_true.num_physical_nodes, 3:9]
+    vm_true = calculate_von_mises(stress)
     clim = (vm_true.min().item(), vm_true.max().item())
     for graph, out_path in (
         (g_true, paths.true),
@@ -245,6 +276,7 @@ def run_inference(
     normalized_graphs: list,
     normalizer,
     target_indices: list[int],
+    geodesics: SurfaceGeodesics,
 ) -> tuple[list[PredictionResult], float]:
     """Run the model over all graphs and collect per-sample metrics.
 
@@ -272,10 +304,22 @@ def run_inference(
             y_true = g.y[loss_mask][:, target_indices]
             y_pred = g_pred.y[loss_mask][:, target_indices]
 
-            mae, rmae, pre = evaluate(y_pred, y_true)
+            y_norm_true = y_true.norm(dim=1)
+            y_norm_pred = y_pred.norm(dim=1)
+
+            loss_l1, loss_rel_l1, loss_top1_rel_l1, loss_peak_rel, loss_peak_loc = (
+                evaluate(y_norm_pred, y_norm_true, geodesics)
+            )
 
             results.append(
-                PredictionResult(graph=g_pred.cpu(), mae=mae, rmae=rmae, pre=pre)
+                PredictionResult(
+                    graph=g_pred.cpu(),
+                    loss_l1=loss_l1,
+                    loss_rel_l1=loss_rel_l1,
+                    loss_top1_rel_l1=loss_top1_rel_l1,
+                    loss_peak_rel=loss_peak_rel,
+                    loss_peak_loc=loss_peak_loc,
+                )
             )
     elapsed = time.time() - start
 
@@ -350,22 +394,24 @@ def save_prediction_visualizations(
         print(
             f"Saved {label} prediction visualization "
             f"(sample={sample_index}, mesh={source_path.stem}, "
-            f"mae={result.mae:.6f}, "
-            f"rmae={result.rmae:.2%}, "
-            f"pre={result.pre:.2%})."
+            f"loss_l1={result.loss_l1:.6f}, "
+            f"loss_rel_l1={result.loss_rel_l1:.2%}, "
+            f"loss_top1_rel_l1={result.loss_top1_rel_l1:.2%}, "
+            f"loss_peak_rel={result.loss_peak_rel:.2%}, "
+            f"loss_peak_loc={result.loss_peak_loc:.2%})."
         )
 
     # Save the sample with the highest relative error.
     worst_sample_index = max(
         range(len(results)),
-        key=lambda index: results[index].rmae,
+        key=lambda index: results[index].loss_rel_l1,
     )
     save_sample(worst_sample_index, label="worst")
 
     # Save the sample with the lowest relative error.
     best_sample_index = min(
         range(len(results)),
-        key=lambda index: results[index].rmae,
+        key=lambda index: results[index].loss_rel_l1,
     )
     save_sample(best_sample_index, label="best")
 
@@ -493,28 +539,33 @@ def main():
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
+    mesh = meshio.read(msh_path)
+    geodesics = SurfaceGeodesics.from_mesh(mesh)
+
     # Run inference
     results, elapsed = run_inference(
-        model, normalized_graphs, normalizer, target_indices
+        model, normalized_graphs, normalizer, target_indices, geodesics
     )
     print(f"Inference completed in {elapsed:.2f}s.")
 
     # Aggregate metrics
     n = len(results)
-    avg_mae = sum(r.mae for r in results) / n
-    avg_rmae = sum(r.rmae for r in results) / n
-    avg_pre = sum(r.pre for r in results) / n
+    avg_loss_l1 = sum(r.loss_l1 for r in results) / n
+    avg_loss_rel_l1 = sum(r.loss_rel_l1 for r in results) / n
+    avg_loss_top1_rel_l1 = sum(r.loss_top1_rel_l1 for r in results) / n
+    avg_loss_peak_rel = sum(r.loss_peak_rel for r in results) / n
+    avg_loss_peak_loc = sum(r.loss_peak_loc for r in results) / n
 
     print("Results:")
-    print(f"  Avg L1 loss:              {avg_mae:.1f}")
-    print(f"  Avg relative L1 loss:     {100 * avg_rmae:.1f}%")
-    print(f"  Avg relative peak error:  {100 * avg_pre:.1f}%")
+    print(f"  Avg L1 loss:              {avg_loss_l1:.1f}")
+    print(f"  Avg relative L1 loss:     {100 * avg_loss_rel_l1:.1f}%")
+    print(f"  Avg top 1% relative L1 loss: {100 * avg_loss_top1_rel_l1:.1f}%")
+    print(f"  Avg relative peak error:  {100 * avg_loss_peak_rel:.1f}%")
+    print(f"  Avg relative peak location error: {100 * avg_loss_peak_loc:.1f}%")
 
     # Optionally save visualisation plots
     if args.plots:
-        visualizer = GraphVisualizer(
-            msh_to_trimesh(meshio.read(msh_path)), jupyter_backend=False
-        )
+        visualizer = GraphVisualizer(msh_to_trimesh(mesh), jupyter_backend=False)
         save_prediction_visualizations(
             results,
             graphs,

@@ -46,7 +46,9 @@ class SurfaceGeodesics:
         if np.any(faces_array < 0) or np.any(faces_array >= len(vertices_array)):
             raise ValueError("faces contain vertex indices outside the vertex array")
         if tolerance < 0 or not np.isfinite(tolerance):
-            raise ValueError(f"tolerance must be finite and non-negative, got {tolerance}")
+            raise ValueError(
+                f"tolerance must be finite and non-negative, got {tolerance}"
+            )
 
         vertex_indices, inverse = np.unique(
             faces_array.reshape(-1), return_inverse=True
@@ -113,6 +115,12 @@ class SurfaceGeodesics:
         The source is projected onto its closest surface triangle and snapped
         to the closest vertex of that triangle. Restricting the snap candidates
         to that triangle prevents a nearby opposite surface from being chosen.
+
+        Args:
+            source: A 3D coordinate on or near the mesh surface.
+
+        Returns:
+            A 1D array of geodesic distances from the source to each compact vertex.
         """
         point = np.asarray(source, dtype=np.float64)
         if point.shape != (3,) or not np.all(np.isfinite(point)):

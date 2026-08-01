@@ -16,7 +16,7 @@ from mpi4py import MPI
 from petsc4py import PETSc
 from scipy.spatial import KDTree
 
-from meshnet.mgn.geodesics import SurfaceGeodesics
+from meshnet.utils.geodesics import SurfaceGeodesics
 from meshnet.utils.mesh import Mesh
 
 YOUNG_MODULUS = 2.0e9
