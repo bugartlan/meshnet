@@ -13,8 +13,6 @@ from meshnet.utils.geodesics import SurfaceGeodesics
 from meshnet.utils.math import calculate_von_mises
 from meshnet.utils.mesh import Mesh
 
-pv.OFF_SCREEN = True
-
 
 class GraphBuilderBase:
     """Base class for constructing geometric graphs from finite element meshes and simulation data.
@@ -39,8 +37,6 @@ class GraphBuilderBase:
         self.std = std
         self.boundary_tol = 1e-6
         self.num_categorical = 1  # For boundary flags
-        self._geodesic_mesh: meshio.Mesh | None = None
-        self._surface_geodesics: SurfaceGeodesics | None = None
 
         self.node_dim = 7
         self.edge_dim = 4
@@ -50,10 +46,18 @@ class GraphBuilderBase:
         mesh: meshio.Mesh,
         y: npt.ArrayLike,
         contacts: list[tuple] | None = None,
+        geodesics: SurfaceGeodesics | None = None,
     ) -> Data:
         if y.shape[0] != mesh.points.shape[0]:
             raise ValueError(
                 f"Output array y must have shape [num_nodes, num_output_features], but got {y.shape} and {mesh.points.shape[0]} nodes."
+            )
+        if geodesics is not None:
+            self._surface_geodesics = geodesics
+        else:
+            self._surface_geodesics = SurfaceGeodesics.from_mesh(
+                mesh,
+                tolerance=self.boundary_tol,
             )
 
         # Node feature matrix with shape [num_nodes, num_node_features]
@@ -187,7 +191,7 @@ class GraphBuilderBase:
         v = mesh.points
         for cell in mesh.cells:
             data = cell.data
-            if "triangle" in cell.type:
+            if "triangle" == cell.type:
                 edge_sets.append(
                     np.vstack(
                         [
@@ -197,7 +201,7 @@ class GraphBuilderBase:
                         ]
                     )
                 )
-            elif "tetra" in cell.type:
+            elif "tetra" == cell.type:
                 edge_sets.append(
                     np.vstack(
                         [
