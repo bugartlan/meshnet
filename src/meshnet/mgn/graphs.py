@@ -1,3 +1,4 @@
+import argparse
 from pathlib import Path
 
 import meshio
@@ -9,6 +10,7 @@ import trimesh
 from torch_geometric.data import Data
 
 from meshnet.mgn.geodesics import SurfaceGeodesics
+from meshnet.utils.mesh import Mesh
 
 pv.OFF_SCREEN = True
 
@@ -39,6 +41,9 @@ class GraphBuilderBase:
         self._geodesic_mesh: meshio.Mesh | None = None
         self._surface_geodesics: SurfaceGeodesics | None = None
 
+        self.node_dim = 7
+        self.edge_dim = 4
+
     def build(
         self,
         mesh: meshio.Mesh,
@@ -64,6 +69,48 @@ class GraphBuilderBase:
             y=y,
             num_physical_nodes=num_physical_nodes,
             contacts=contacts,
+        )
+
+    def generate_graph_dataset(
+        self,
+        raw_path: Path,
+        out_path: Path,
+        num_samples: int | None = None,
+    ):
+        """Generate a dataset of graphs from raw FEM simulation data.
+
+        Args:
+            raw_path (Path): Path to the raw .npz data file containing mesh path and simulation outputs.
+            out_path (Path): Path to save the generated graph dataset (.pt file).
+            num_samples (int | None): Optional limit on the number of samples to process. If None processes all samples.
+        """
+        with np.load(raw_path, allow_pickle=False) as raw:
+            points = raw["points"]
+            forces = raw["forces"]
+            y = raw["y"]
+            mesh_path = Path(raw["mesh_path"].item())
+
+        n = min(num_samples or points.shape[0], points.shape[0])
+
+        mesh = Mesh.read(str(mesh_path))
+        graphs = [
+            self.build(mesh.volume, y[i], contacts=list(zip(points[i], forces[i])))
+            for i in range(n)
+        ]
+        torch.save(
+            {
+                "params": {
+                    "node_dim": self.node_dim,
+                    "edge_dim": self.edge_dim,
+                    "output_dim": y.shape[1],
+                    "num_categorical": self.num_categorical,
+                    "sigma": self.std,
+                },
+                "graphs": graphs,
+                "mesh_path": mesh_path,
+                "source_path": raw_path,
+            },
+            out_path,
         )
 
     def gaussian_loads(
@@ -259,6 +306,7 @@ class GraphBuilderVirtual(GraphBuilderBase):
 
     def __init__(self, std: float = 0.001):
         super().__init__(std)
+        self.node_dim = 8
         self.num_categorical = 2  # For boundary and virtual flags
 
     def build(
@@ -568,3 +616,51 @@ class GraphVisualizer:
             show_contacts=True,
             debug=debug,
         )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Generate graphs from FEM data.")
+    parser.add_argument(
+        "filepath",
+        type=Path,
+        nargs="+",
+        help="Path to the raw .npz data file or directory.",
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=Path,
+        default=Path("data"),
+        help="Output directory for saving the generated graphs.",
+    )
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=None,
+        help="Number of samples to generate from the raw .npz file.",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    builder = GraphBuilderVirtual(std=0.01)
+
+    files = []
+    for path in args.filepath:
+        if path.is_file():
+            files.append(path)
+        elif path.is_dir():
+            files.extend(path.glob("*.npz"))
+        else:
+            raise RuntimeError(f"Path {path} is not a file or directory.")
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    for f in files:
+        out_path = args.out_dir / f.with_suffix(".pt").name
+        builder.generate_graph_dataset(f, out_path, num_samples=args.num_samples)
+        print(f"Saved graph dataset to {out_path}")
+
+
+if __name__ == "__main__":
+    main()

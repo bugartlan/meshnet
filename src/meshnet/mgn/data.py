@@ -7,9 +7,7 @@ import torch
 import trimesh
 from tqdm import tqdm
 
-from meshnet.mgn.graphs import GraphBuilderVirtual
 from meshnet.mgn.simulator import Simulator
-from meshnet.mgn.utils import info
 from meshnet.utils.mesh import Mesh
 
 
@@ -43,9 +41,6 @@ class DataGenerator:
 
         self.rng = np.random.default_rng(seed)
 
-        # self.builder = GraphBuilder(std=sigma)
-        self.builder = GraphBuilderVirtual(std=sigma)
-
     def process(self, filepath: Path) -> list[torch.Tensor]:
         """Generate graphs with ground truth labels.
 
@@ -59,19 +54,23 @@ class DataGenerator:
             raise FileNotFoundError(f"Mesh file {filepath} not found.")
 
         mesh = Mesh.read(str(filepath))
-
         points, forces = self._sample(mesh)
-        results = self._simulate(mesh, points, forces)
+        y = np.stack(self._simulate(mesh, points, forces))
 
-        graphs = []
-        for y, p, f in zip(results, points, forces):
-            graphs.append(self.builder.build(mesh.volume, y, contacts=list(zip(p, f))))
+        out_path = self.out_dir / f"{filepath.stem}.npz"
+        np.savez(
+            out_path,
+            points=points,
+            forces=forces,
+            y=y,
+            mesh_path=np.asarray(str(filepath)),
+            sigma=np.asarray(self.sigma),
+            seed=np.asarray(self.seed),
+            schema_version=np.asarray(1),
+        )
+        return out_path
 
-        return graphs
-
-    def _sample(
-        self, mesh: Mesh, tol=0.01
-    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    def _sample(self, mesh: Mesh, tol=0.01):
         num_total_points = self.num_samples * self.num_contacts
 
         # Sample 2x buffer to account for filtering
@@ -181,25 +180,8 @@ def main():
             raise RuntimeError(f"Path {path} is not a file or directory.")
 
     for f in files:
-        graphs = generator.process(f)
-        out_path = args.out_dir / (f.stem + f"_{len(graphs)}.pt")
-
-        node_dim, edge_dim, output_dim = info(graphs[0])
-        num_categorical = generator.builder.num_categorical
-        torch.save(
-            {
-                "params": {
-                    "node_dim": node_dim,
-                    "edge_dim": edge_dim,
-                    "output_dim": output_dim,
-                    "num_categorical": num_categorical,
-                },
-                "graphs": graphs,
-                "mesh": f,
-            },
-            out_path,
-        )
-        print(f"Saved {len(graphs)} samples to {out_path}")
+        out_path = generator.process(f)
+        print(f"Saved data to {out_path}")
 
 
 if __name__ == "__main__":
