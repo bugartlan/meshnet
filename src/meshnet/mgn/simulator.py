@@ -84,11 +84,19 @@ class Simulator:
         self._source_points = np.asarray(source_mesh.volume.points).copy()
 
         self.domain = self._create_domain(source_mesh)
+<<<<<<< HEAD
         self.gdim = self.domain.geometry.dim
         self.cdim = self.domain.topology.dim
         self.fdim = self.cdim - 1
 
         self.V = fem.FunctionSpace(self.domain, ("Lagrange", self.order, (self.gdim,)))
+=======
+        self.gdim = self.domain.geometry.dim  # coordinate space
+        self.cdim = self.domain.topology.dim  # cell dimension (tetra=3)
+        self.fdim = self.cdim - 1
+
+        self.V = fem.functionspace(self.domain, ("Lagrange", self.order, (self.gdim,)))
+>>>>>>> c2ce5de04b18df150b4e56818801e7c3418a2632
 
         self._surface_geodesics = geodesics or SurfaceGeodesics.from_mesh(
             source_mesh, tolerance=BOUNDARY_TOLERANCE
@@ -96,6 +104,11 @@ class Simulator:
 
         self.bc = self._create_fixed_bc()
 
+<<<<<<< HEAD
+=======
+        self.a, self.K, self.solver = self._create_elasticity_system()
+
+>>>>>>> c2ce5de04b18df150b4e56818801e7c3418a2632
         self._projection_systems: dict[ProjectionKey, _ProjectionSystem] = {}
         self._dof_trees: dict[int, tuple[Any, KDTree]] = {}
         self._mesh_point_dofs: dict[int, tuple[Any, np.ndarray]] = {}
@@ -272,17 +285,28 @@ class Simulator:
         """
         zero_traction = fem.Constant(
             self.domain,
+<<<<<<< HEAD
             np.zeros(
                 self.geometric_dimension,
                 dtype=default_scalar_type,
             ),
+=======
+            np.zeros(self.gdim, dtype=default_scalar_type),
+>>>>>>> c2ce5de04b18df150b4e56818801e7c3418a2632
         )
+        v = ufl.TestFunction(self.V)
+
+        load_form = ufl.dot(zero_traction, v) * ufl.dx
 
         load_form = ufl.dot(zero_traction, self.v) * ufl.dx
 
         for point, force in loads:
             traction = self._traction(point, force)
+<<<<<<< HEAD
             load_form += ufl.dot(traction, self.v) * ufl.ds
+=======
+            load_form += ufl.dot(traction, v) * ufl.ds
+>>>>>>> c2ce5de04b18df150b4e56818801e7c3418a2632
 
         rhs = assemble_vector(fem.form(load_form))
 
@@ -293,7 +317,11 @@ class Simulator:
             populate_ghosts=True,
         )
 
+<<<<<<< HEAD
         apply_lifting(rhs, [self.K], bcs=[[self.bc]])
+=======
+        apply_lifting(rhs, [self.a], bcs=[[self.bc]])
+>>>>>>> c2ce5de04b18df150b4e56818801e7c3418a2632
         self._accumulate_ghost_values(rhs, populate_ghosts=True)
         set_bc(rhs, [self.bc])
 
@@ -349,10 +377,7 @@ class Simulator:
         rhs = assemble_vector(
             fem.form(ufl.inner(expression, system.test_function) * ufl.dx)
         )
-        rhs.ghostUpdate(
-            addv=PETSc.InsertMode.ADD_VALUES,
-            mode=PETSc.ScatterMode.REVERSE,
-        )
+        self._accumulate_ghost_values(rhs, populate_ghosts=True)
 
         result = fem.Function(system.function_space)
         system.solver.solve(rhs, result.x.petsc_vec)
@@ -393,15 +418,15 @@ class Simulator:
     def _colliding_cell_indices(
         self, points: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        candidates = geometry.compute_collisions_points(self._bb_tree, points)
+        candidates = geometry.compute_collisions_points(self._bounding_box_tree, points)
         collisions = geometry.compute_colliding_cells(self.domain, candidates, points)
 
         point_indices: list[int] = []
         cell_indices: list[int] = []
-        for point_index in range(len(points)):
-            cells = collisions.links(point_index)
+        for i in range(len(points)):
+            cells = collisions.links(i)
             if len(cells):
-                point_indices.append(point_index)
+                point_indices.append(i)
                 cell_indices.append(cells[0])
 
         return (
@@ -411,16 +436,16 @@ class Simulator:
 
     def _prepare_mesh_point_evaluation(self) -> tuple[np.ndarray, np.ndarray]:
         """Cache evaluation coordinates and cells for the volume-mesh points."""
-        evaluation_points = self._mesh_points.copy()
-        evaluation_cells = np.full(len(self._mesh_points), -1, dtype=np.int32)
+        evaluation_points = self._source_points.copy()
+        evaluation_cells = np.full(len(self._source_points), -1, dtype=np.int32)
 
-        point_indices, cell_indices = self._colliding_cell_indices(self._mesh_points)
+        point_indices, cell_indices = self._colliding_cell_indices(self._source_points)
         evaluation_cells[point_indices] = cell_indices
 
         missing_indices = np.flatnonzero(evaluation_cells < 0)
         if missing_indices.size:
             projected_indices, projected_points, projected_cells = self._project_inside(
-                self._mesh_points[missing_indices]
+                self._source_points[missing_indices]
             )
             resolved_indices = missing_indices[projected_indices]
             evaluation_points[resolved_indices] = projected_points
@@ -447,7 +472,7 @@ class Simulator:
             return empty_indices, empty_points, empty_indices
 
         closest_cells = geometry.compute_closest_entity(
-            self._bb_tree,
+            self._bounding_box_tree,
             self._cell_midpoint_tree,
             self.domain,
             points,
@@ -499,7 +524,7 @@ class Simulator:
             self._dof_trees[key] = cached
         return cached[1]
 
-    def evaluate_mesh_points(self, function: fem.Function) -> np.ndarray:
+    def evaluate_source_points(self, function: fem.Function) -> np.ndarray:
         """Evaluate a function at the volume-mesh points using cached cells.
 
         The geometric search is performed once when the simulator is created.
@@ -509,13 +534,13 @@ class Simulator:
         """
         function_space = function.function_space
         block_size = function_space.dofmap.index_map_bs
-        values = np.zeros((len(self._mesh_points), block_size), dtype=np.float64)
+        values = np.zeros((len(self._source_points), block_size), dtype=np.float64)
 
-        resolved = self._mesh_evaluation_cells >= 0
+        resolved = self._mesh_eval_cells >= 0
         if np.any(resolved):
             values[resolved] = function.eval(
-                self._mesh_evaluation_points[resolved],
-                self._mesh_evaluation_cells[resolved],
+                self._mesh_eval_points[resolved],
+                self._mesh_eval_cells[resolved],
             )
 
         missing_indices = np.flatnonzero(~resolved)
@@ -524,7 +549,7 @@ class Simulator:
             cached = self._mesh_point_dofs.get(key)
             if cached is None or cached[0] is not function_space:
                 nearest_dofs = self._nearest_dof_tree(function_space).query(
-                    self._mesh_points[missing_indices], k=1
+                    self._source_points[missing_indices], k=1
                 )[1]
                 cached = (function_space, np.asarray(nearest_dofs, dtype=np.intp))
                 self._mesh_point_dofs[key] = cached
