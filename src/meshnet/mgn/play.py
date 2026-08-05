@@ -10,9 +10,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from meshnet.mgn.graphs import GraphVisualizer
+from meshnet.mgn.graph_visualizer import GraphVisualizer
 from meshnet.mgn.nets import EncodeProcessDecode, MeshGraphNet
-from meshnet.mgn.normalizer import GraphNormalizer, LogNormalizer
+from meshnet.mgn.normalizer import GraphNormalizer
 from meshnet.mgn.utils import msh_to_trimesh
 from meshnet.utils.geodesics import SurfaceGeodesics
 from meshnet.utils.math import calculate_von_mises
@@ -79,7 +79,10 @@ def prepare_graphs(graphs: list, normalizer, mode: str = "bottom"):
 
 
 def evaluate(
-    pred: torch.Tensor, true: torch.Tensor, geodesics: SurfaceGeodesics
+    pred: torch.Tensor,
+    true: torch.Tensor,
+    geodesics: SurfaceGeodesics,
+    positions: torch.Tensor | None = None,
 ) -> tuple[float, float, float, float, float]:
     """Compute error metrics between predicted and ground-truth values.
 
@@ -87,6 +90,10 @@ def evaluate(
         pred: Predicted values.
         true: Ground-truth values.
         geodesics: Geodesic solver for the underlying surface mesh.
+        positions: Coordinates corresponding to the first dimension of
+            ``pred`` and ``true``. Peak coordinates are projected onto the
+            surface before their geodesic distance is computed. If omitted,
+            values are assumed to use the compact surface-vertex ordering.
 
     Returns:
         Tuple of (L1 loss, relative L1 loss, top 1% relative L1 loss, peak relative error, peak location relative error).
@@ -114,9 +121,20 @@ def evaluate(
     values_per_vertex = pred.shape[-1] if pred.ndim > 1 else 1
     pred_max_idx = torch.argmax(torch.abs(pred)).item() // values_per_vertex
     true_max_idx = torch.argmax(torch.abs(true)).item() // values_per_vertex
-    loss_peak_loc = geodesics.distance_from(geodesics.vertices[true_max_idx])[
-        pred_max_idx
-    ]
+    if positions is None:
+        peak_positions = geodesics.vertices
+    else:
+        if len(positions) != len(pred) or len(positions) != len(true):
+            raise ValueError(
+                "positions must have the same number of rows as pred and true"
+            )
+        peak_positions = positions.detach().cpu().numpy()
+
+    true_surface_idx = geodesics.closest_vertex(peak_positions[true_max_idx])
+    pred_surface_idx = geodesics.closest_vertex(peak_positions[pred_max_idx])
+    loss_peak_loc = geodesics.distance_from(
+        geodesics.vertices[true_surface_idx]
+    )[pred_surface_idx]
 
     return (loss_l1, loss_rel_l1, loss_top1_rel_l1, loss_peak_rel, loss_peak_loc)
 
@@ -303,12 +321,13 @@ def run_inference(
             loss_mask = g.loss_mask
             y_true = g.y[loss_mask][:, target_indices]
             y_pred = g_pred.y[loss_mask][:, target_indices]
+            positions = g.pos[loss_mask]
 
             y_norm_true = y_true.norm(dim=1)
             y_norm_pred = y_pred.norm(dim=1)
 
             loss_l1, loss_rel_l1, loss_top1_rel_l1, loss_peak_rel, loss_peak_loc = (
-                evaluate(y_norm_pred, y_norm_true, geodesics)
+                evaluate(y_norm_pred, y_norm_true, geodesics, positions)
             )
 
             results.append(
@@ -508,7 +527,7 @@ def main():
     # Load dataset
     data = torch.load(args.dataset, weights_only=False)
     graphs = [g.to(device) for g in data["graphs"]]
-    msh_path: Path = data["mesh"]
+    msh_path: Path = Path(data["mesh_path"])
     print(f"Loaded dataset '{args.dataset}' with {len(graphs)} graphs.")
     print(
         f"Each graph has {graphs[0].num_nodes} nodes and {graphs[0].num_edges} edges."

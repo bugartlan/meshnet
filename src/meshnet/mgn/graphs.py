@@ -1,648 +1,434 @@
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 
-import meshio
 import numpy as np
 import numpy.typing as npt
-import pyvista as pv
 import torch
-import trimesh
 from torch_geometric.data import Data
 
-from meshnet.utils.geodesics import SurfaceGeodesics
-from meshnet.utils.math import calculate_von_mises
-from meshnet.utils.mesh import Mesh
+
+@dataclass(frozen=True, slots=True)
+class MeshGraphTemplate:
+    """Static graph data shared by every load case on one mesh."""
+
+    pos: torch.Tensor
+    boundary: torch.Tensor
+    edge_index: torch.Tensor
+    edge_attr: torch.Tensor
+
+    @property
+    def num_nodes(self) -> int:
+        return int(self.pos.shape[0])
+
+    @classmethod
+    def from_arrays(
+        cls,
+        vertices: npt.ArrayLike,
+        tetra: npt.ArrayLike,
+        boundary_mask: npt.ArrayLike,
+    ) -> "MeshGraphTemplate":
+        vertices_np = np.asarray(vertices, dtype=np.float32)
+        tetra_np = np.asarray(tetra, dtype=np.int64)
+        boundary_np = np.asarray(boundary_mask, dtype=np.float32).reshape(-1, 1)
+
+        if vertices_np.ndim != 2 or vertices_np.shape[1] != 3:
+            raise ValueError(
+                f"vertices must have shape [N, 3], got {vertices_np.shape}"
+            )
+        if tetra_np.ndim != 2 or tetra_np.shape[1] != 4:
+            raise ValueError(f"tetra must have shape [M, 4], got {tetra_np.shape}")
+        if boundary_np.shape != (len(vertices_np), 1):
+            raise ValueError(
+                f"boundary_mask must have {len(vertices_np)} entries, "
+                f"got {boundary_np.shape}"
+            )
+
+        edge_index, edge_attr = _tetra_edges(vertices_np, tetra_np)
+        return cls(
+            pos=torch.from_numpy(vertices_np),
+            boundary=torch.from_numpy(boundary_np),
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+        )
+
+
+def _tetra_edges(
+    vertices: np.ndarray,
+    tetra: np.ndarray,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    local_pairs = np.asarray(
+        ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)),
+        dtype=np.int64,
+    )
+    undirected = tetra[:, local_pairs].reshape(-1, 2)
+    undirected.sort(axis=1)
+    undirected = np.unique(undirected, axis=0)
+
+    src = undirected[:, 0]
+    dst = undirected[:, 1]
+    displacement = vertices[dst] - vertices[src]
+    distance = np.linalg.norm(displacement, axis=1, keepdims=True)
+
+    edge_index = np.hstack(
+        (
+            np.stack((src, dst), axis=0),
+            np.stack((dst, src), axis=0),
+        )
+    )
+    edge_attr = np.vstack(
+        (
+            np.hstack((displacement, distance)),
+            np.hstack((-displacement, distance)),
+        )
+    )
+    return (
+        torch.from_numpy(edge_index).long(),
+        torch.from_numpy(edge_attr).float(),
+    )
 
 
 class GraphBuilderBase:
-    """Base class for constructing geometric graphs from finite element meshes and simulation data.
-
-    Converts mesh geometry and nodal outputs into PyTorch Geometric Data objects suitable for
-    graph neural network training. Subclasses implement different node feature augmentation strategies.
+    """Build graphs only from saved, vertex-aligned FEM arrays.
 
     Node features: [x, y, z, fx, fy, fz, is_boundary]
-        - Spatial coordinates (x, y, z)
-        - Nodal forces computed from gaussian-weighted load distribution (fx, fy, fz)
-        - Binary boundary flag indicating fixed support nodes (is_boundary)
-
-    Edge features: [dx, dy, dz, distance]
-        - Displacement vector between connected nodes (dx, dy, dz)
-        - Euclidean distance metric (distance)
+    Targets: [ux, uy, uz, sxx, syy, szz, sxy, syz, sxz]
     """
 
-    def __init__(self, std: float = 0.001):
-        if std <= 0:
-            raise ValueError(f"std must be positive, got {std}")
+    num_categorical = 1
+    edge_dim = 4
 
-        self.std = std
-        self.boundary_tol = 1e-6
-        self.num_categorical = 1  # For boundary flags
-
-        self.node_dim = 7
-        self.edge_dim = 4
+    @property
+    def node_dim(self) -> int:
+        return 7
 
     def build(
         self,
-        mesh: meshio.Mesh,
-        y: npt.ArrayLike,
-        contacts: list[tuple] | None = None,
-        geodesics: SurfaceGeodesics | None = None,
+        template: MeshGraphTemplate,
+        vertex_forces: npt.ArrayLike,
+        vertex_displacement: npt.ArrayLike,
+        vertex_stress: npt.ArrayLike,
+        contacts: list[tuple[np.ndarray, np.ndarray]] | None = None,
     ) -> Data:
-        if y.shape[0] != mesh.points.shape[0]:
-            raise ValueError(
-                f"Output array y must have shape [num_nodes, num_output_features], but got {y.shape} and {mesh.points.shape[0]} nodes."
-            )
-        if geodesics is not None:
-            self._surface_geodesics = geodesics
-        else:
-            self._surface_geodesics = SurfaceGeodesics.from_mesh(
-                mesh,
-                tolerance=self.boundary_tol,
-            )
+        contacts = contacts or []
+        forces, displacement, stress = self._validate_fields(
+            template,
+            vertex_forces,
+            vertex_displacement,
+            vertex_stress,
+        )
 
-        # Node feature matrix with shape [num_nodes, num_node_features]
-        x = self._make_nodes(mesh, contacts)
-        y = torch.tensor(y, dtype=torch.float32)
-        edge_index, edge_attr = self._make_edges(mesh)
-
-        num_physical_nodes = mesh.points.shape[0]
+        x = self._physical_node_features(template, forces, contacts)
+        y = torch.hstack((displacement, stress))
+        target_mask = torch.ones(template.num_nodes, dtype=torch.bool)
 
         return Data(
             x=x,
-            edge_index=edge_index,
-            edge_attr=edge_attr,
+            pos=template.pos,
+            edge_index=template.edge_index,
+            edge_attr=template.edge_attr,
             y=y,
-            num_physical_nodes=num_physical_nodes,
+            target_mask=target_mask,
+            num_physical_nodes=template.num_nodes,
             contacts=contacts,
         )
 
-    def generate_graph_dataset(
+    def _physical_node_features(
         self,
-        raw_path: Path,
-        out_path: Path,
-        num_samples: int | None = None,
-    ):
-        """Generate a dataset of graphs from raw FEM simulation data.
-
-        Args:
-            raw_path (Path): Path to the raw .npz data file containing mesh path and simulation outputs.
-            out_path (Path): Path to save the generated graph dataset (.pt file).
-            num_samples (int | None): Optional limit on the number of samples to process. If None processes all samples.
-        """
-        with np.load(raw_path, allow_pickle=False) as raw:
-            points = raw["points"]
-            forces = raw["forces"]
-            y = raw["y"]
-            mesh_path = Path(raw["mesh_path"].item())
-
-        n = min(num_samples or points.shape[0], points.shape[0])
-
-        mesh = Mesh.read(str(mesh_path))
-        graphs = [
-            self.build(mesh.volume, y[i], contacts=list(zip(points[i], forces[i])))
-            for i in range(n)
-        ]
-        torch.save(
-            {
-                "params": {
-                    "node_dim": self.node_dim,
-                    "edge_dim": self.edge_dim,
-                    "output_dim": y.shape[1],
-                    "num_categorical": self.num_categorical,
-                    "sigma": self.std,
-                },
-                "graphs": graphs,
-                "mesh_path": mesh_path,
-                "source_path": raw_path,
-            },
-            out_path,
-        )
-
-    def gaussian_loads(
-        self,
-        mesh: meshio.Mesh,
-        contacts: list[tuple],
+        template: MeshGraphTemplate,
+        vertex_forces: torch.Tensor,
+        contacts: list[tuple[np.ndarray, np.ndarray]],
     ) -> torch.Tensor:
-        """Distribute contact forces over the surface using geodesic Gaussians."""
-        coords = np.asarray(mesh.points, dtype=np.float64)
-        n = coords.shape[0]
-        if not contacts:
-            return torch.zeros((n, 3), dtype=torch.float32)
+        del contacts
+        return torch.hstack((template.pos, vertex_forces, template.boundary))
 
-        geodesics = self._get_surface_geodesics(mesh)
-
-        frc = np.asarray([f for _, f in contacts], dtype=np.float64)
-        if frc.shape != (len(contacts), 3) or not np.all(np.isfinite(frc)):
-            raise ValueError("Contact forces must be finite 3D vectors")
-
-        w = np.zeros((n, len(contacts)), dtype=np.float64)
-        for contact_index, (point, _) in enumerate(contacts):
-            distances = geodesics.distance_from(point)
-            w[geodesics.vertex_indices, contact_index] = np.exp(
-                -(distances**2) / (2 * self.std**2)
-            )
-
-        w_sum = w.sum(axis=0, keepdims=True)
-        if not np.all(np.isfinite(w_sum)) or np.any(w_sum <= np.finfo(np.float64).tiny):
-            raise ValueError(
-                "Contact kernel normalization failed; std may be too small "
-                "for the surface mesh"
-            )
-        w /= w_sum
-
-        return torch.from_numpy((w @ frc).astype(np.float32, copy=False))
-
-    def _get_surface_geodesics(self, mesh: meshio.Mesh) -> SurfaceGeodesics:
-        """Return the cached solver for ``mesh``, rebuilding on identity change."""
-        if self._geodesic_mesh is not mesh or self._surface_geodesics is None:
-            self._geodesic_mesh = mesh
-            self._surface_geodesics = SurfaceGeodesics.from_mesh(
-                mesh,
-                tolerance=self.boundary_tol,
-            )
-        return self._surface_geodesics
-
-    def _make_nodes(
-        self,
-        mesh: meshio.Mesh,
-        loads: list[tuple[npt.ArrayLike, npt.ArrayLike]],
-    ) -> torch.Tensor:
-        vertices = mesh.points.astype(np.float32, copy=False)
-
-        # Position Coordinates
-        coords = torch.from_numpy(vertices)
-
-        # Force Vectors
-        forces = self.gaussian_loads(mesh, loads)
-
-        # Boundary Mask
-        mask_np = np.isclose(vertices[:, 2], 0.0, atol=self.boundary_tol).astype(
-            np.float32
-        )[:, None]
-        mask = torch.from_numpy(mask_np)
-
-        return torch.hstack([coords, forces, mask])
-
-    def _make_edges(self, mesh: meshio.Mesh) -> torch.Tensor:
-        edge_index = []
-        edge_attr = []
-        edge_sets = []
-
-        v = mesh.points
-        for cell in mesh.cells:
-            data = cell.data
-            if "triangle" == cell.type:
-                edge_sets.append(
-                    np.vstack(
-                        [
-                            data[:, [0, 1]],
-                            data[:, [1, 2]],
-                            data[:, [2, 0]],
-                        ]
-                    )
+    @staticmethod
+    def _validate_fields(
+        template: MeshGraphTemplate,
+        vertex_forces: npt.ArrayLike,
+        vertex_displacement: npt.ArrayLike,
+        vertex_stress: npt.ArrayLike,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_nodes = template.num_nodes
+        arrays = {
+            "vertex_forces": (vertex_forces, 3),
+            "vertex_displacement": (vertex_displacement, 3),
+            "vertex_stress": (vertex_stress, 6),
+        }
+        tensors: list[torch.Tensor] = []
+        for name, (values, width) in arrays.items():
+            array = np.asarray(values, dtype=np.float32)
+            expected = (num_nodes, width)
+            if array.shape != expected:
+                raise ValueError(
+                    f"{name} must have shape {expected}, got {array.shape}"
                 )
-            elif "tetra" == cell.type:
-                edge_sets.append(
-                    np.vstack(
-                        [
-                            data[:, [0, 1]],
-                            data[:, [0, 2]],
-                            data[:, [0, 3]],
-                            data[:, [1, 2]],
-                            data[:, [1, 3]],
-                            data[:, [2, 3]],
-                        ]
-                    )
-                )
-        if not edge_sets:
-            raise ValueError("No supported cell types (tetra, triangle) found in mesh.")
-
-        edges = np.vstack(edge_sets)
-        edges.sort(axis=1)
-        unique_edges = np.unique(edges, axis=0)
-
-        src, dst = unique_edges[:, 0], unique_edges[:, 1]
-        disp = v[dst] - v[src]  # shape (E, 3)
-        dist = np.linalg.norm(disp, axis=1, keepdims=True)  # shape (E, 1)
-
-        edge_index = np.hstack(
-            [np.stack([src, dst], axis=0), np.stack([dst, src], axis=0)]
-        )  # shape (2, 2E)
-        edge_attr = np.vstack(
-            [np.hstack([disp, dist]), np.hstack([-disp, dist])]
-        )  # shape (2E, 4)
-
-        return (
-            torch.tensor(edge_index, dtype=torch.long),
-            torch.tensor(edge_attr, dtype=torch.float32),
-        )
+            if not np.all(np.isfinite(array)):
+                raise ValueError(f"{name} contains non-finite values")
+            tensors.append(torch.from_numpy(array))
+        return tensors[0], tensors[1], tensors[2]
 
 
 class GraphBuilderAugment(GraphBuilderBase):
-    """Graph builder that augments node features with global contact information.
+    """Add relative contact positions and contact forces to every node."""
 
-    Each node is enriched with features from all contact points and their forces,
-    enabling the model to learn from global context.
+    def __init__(self, num_contacts: int) -> None:
+        self.num_contacts = num_contacts
 
-    Node features: [x, y, z, fx, fy, fz, cp1_rel_x, cp1_rel_y, cp1_rel_z, cf1_x, cf1_y, cf1_z, ..., is_boundary]
-        - Position (x, y, z)
-        - Nodal forces from gaussian load distribution (fx, fy, fz)
-        - For each contact: relative displacement to contact point (cp_rel_x/y/z) and contact force (cf_x/y/z)
-        - Boundary flag (1 if z ≈ 0, else 0)
+    @property
+    def node_dim(self) -> int:
+        return 7 + 6 * self.num_contacts
 
-    Edge features: [dx, dy, dz, distance]
-        - Displacement vector and euclidean distance between nodes
-    """
-
-    def _make_nodes(
+    def _physical_node_features(
         self,
-        mesh: meshio.Mesh,
-        loads: list[tuple[np.ndarray, np.ndarray]],
+        template: MeshGraphTemplate,
+        vertex_forces: torch.Tensor,
+        contacts: list[tuple[np.ndarray, np.ndarray]],
     ) -> torch.Tensor:
-        vertices = mesh.points
-        num_nodes = vertices.shape[0]
-
-        # Position Coordinates
-        coords = torch.tensor(vertices, dtype=torch.float32)
-
-        # Global Attributes
-        if loads:
-            loads.sort(key=lambda x: tuple(x[0]))
-
-            Ps = []
-            Fs = []
-            for p, f in loads:
-                Ps.append(torch.tensor(vertices - p, dtype=torch.float32))
-                Fs.append(torch.tensor(np.tile(f, (num_nodes, 1)), dtype=torch.float32))
-
-            inter = torch.stack([torch.stack(Ps), torch.stack(Fs)], dim=1).reshape(
-                -1, num_nodes, 3
+        if len(contacts) != self.num_contacts:
+            raise ValueError(
+                f"Expected {self.num_contacts} contacts, got {len(contacts)}"
             )
 
-            attrs = inter.permute(1, 0, 2).reshape(num_nodes, -1)
-        else:
-            attrs = torch.zeros((num_nodes, 0), dtype=torch.float32)
+        sorted_contacts = sorted(contacts, key=lambda item: tuple(item[0]))
+        global_features: list[torch.Tensor] = []
+        for point, force in sorted_contacts:
+            point_tensor = torch.as_tensor(point, dtype=torch.float32)
+            force_tensor = torch.as_tensor(force, dtype=torch.float32)
+            relative = template.pos - point_tensor
+            tiled_force = force_tensor.expand(template.num_nodes, -1)
+            global_features.extend((relative, tiled_force))
 
-        # Force Vectors
-        forces = self.gaussian_loads(mesh, loads)
-
-        # Boundary Mask
-        mask = torch.zeros((num_nodes, 1), dtype=torch.float32)
-        mask[np.isclose(vertices[:, 2], 0.0, atol=self.boundary_tol)] = 1
-
-        return torch.hstack([coords, forces, attrs, mask])
+        return torch.hstack(
+            (
+                template.pos,
+                vertex_forces,
+                *global_features,
+                template.boundary,
+            )
+        )
 
 
 class GraphBuilderVirtual(GraphBuilderBase):
-    """Graph builder with virtual nodes at contact points.
+    """Represent each contact as a virtual node connected to all mesh vertices."""
 
-    Virtual nodes represent contact locations and connect to all physical nodes,
-    enabling the model to tap into contact information.
+    num_categorical = 2
 
-    Node features: [x, y, z, fx, fy, fz, is_boundary, is_virtual]
-        - Position (x, y, z)
-        - Nodal forces from gaussian load distribution (fx, fy, fz)
-        - Boundary flag (1 if z ≈ 0, else 0)
-        - Virtual flag (1 for contact nodes, 0 for mesh nodes)
-
-    Edge features: [dx, dy, dz, distance]
-        - Displacement vector and euclidean distance between nodes
-    """
-
-    def __init__(self, std: float = 0.001):
-        super().__init__(std)
-        self.node_dim = 8
-        self.num_categorical = 2  # For boundary and virtual flags
+    @property
+    def node_dim(self) -> int:
+        return 8
 
     def build(
         self,
-        mesh: meshio.Mesh,
-        y: np.ndarray | None = None,
-        contacts: list[tuple] | None = None,
+        template: MeshGraphTemplate,
+        vertex_forces: npt.ArrayLike,
+        vertex_displacement: npt.ArrayLike,
+        vertex_stress: npt.ArrayLike,
+        contacts: list[tuple[np.ndarray, np.ndarray]] | None = None,
     ) -> Data:
         contacts = contacts or []
+        forces, displacement, stress = self._validate_fields(
+            template,
+            vertex_forces,
+            vertex_displacement,
+            vertex_stress,
+        )
 
-        if y is None:
-            y = np.zeros((mesh.points.shape[0], 4), dtype=np.float32)
-        elif y.shape[0] != mesh.points.shape[0]:
-            raise ValueError(
-                f"Output array y must have shape [num_nodes, num_output_features], but got {y.shape} and {mesh.points.shape[0]} nodes."
+        physical_x = torch.hstack(
+            (
+                template.pos,
+                forces,
+                template.boundary,
+                torch.zeros((template.num_nodes, 1), dtype=torch.float32),
+            )
+        )
+        physical_y = torch.hstack((displacement, stress))
+
+        if not contacts:
+            return Data(
+                x=physical_x,
+                pos=template.pos,
+                edge_index=template.edge_index,
+                edge_attr=template.edge_attr,
+                y=physical_y,
+                target_mask=torch.ones(template.num_nodes, dtype=torch.bool),
+                num_physical_nodes=template.num_nodes,
+                contacts=[],
             )
 
-        # Node feature matrix with shape [num_nodes, num_node_features]
-        x = self._make_nodes(mesh, contacts)
-
-        # Pad for virtual nodes
-        if contacts:
-            y = np.vstack([y, np.zeros((len(contacts), y.shape[1]), dtype=np.float32)])
-        y = torch.tensor(y, dtype=torch.float32)
-
-        # Edges
-        edge_index, edge_attr = self._make_edges(mesh)
-        if contacts:
-            v_idx, v_attr = self._make_virtual_edges(mesh, contacts)
-            edge_index = torch.hstack([edge_index, v_idx])
-            edge_attr = torch.vstack([edge_attr, v_attr])
-
-        num_physical_nodes = mesh.points.shape[0]
+        virtual_x, virtual_pos = self._virtual_nodes(contacts)
+        virtual_y = torch.zeros(
+            (len(contacts), physical_y.shape[1]), dtype=torch.float32
+        )
+        virtual_edges, virtual_edge_attr = self._virtual_edges(
+            template.pos, virtual_pos
+        )
 
         return Data(
-            x=x,
-            edge_index=edge_index,
-            edge_attr=edge_attr,
-            y=y,
-            num_physical_nodes=num_physical_nodes,
+            x=torch.vstack((physical_x, virtual_x)),
+            pos=torch.vstack((template.pos, virtual_pos)),
+            edge_index=torch.hstack((template.edge_index, virtual_edges)),
+            edge_attr=torch.vstack((template.edge_attr, virtual_edge_attr)),
+            y=torch.vstack((physical_y, virtual_y)),
+            target_mask=torch.cat(
+                (
+                    torch.ones(template.num_nodes, dtype=torch.bool),
+                    torch.zeros(len(contacts), dtype=torch.bool),
+                )
+            ),
+            num_physical_nodes=template.num_nodes,
             contacts=contacts,
         )
 
-    def _make_nodes(
-        self,
-        mesh: meshio.Mesh,
-        loads: list[tuple[np.ndarray, np.ndarray]],
-    ) -> torch.Tensor:
-        vertices = mesh.points
-        num_nodes = vertices.shape[0]
-
-        # Position Coordinates
-        coords = torch.tensor(vertices, dtype=torch.float32)
-
-        # Force Vectors
-        forces = self.gaussian_loads(mesh, loads)
-
-        # Boundary Mask
-        mask = torch.zeros((num_nodes, 1), dtype=torch.float32)
-        mask[np.isclose(vertices[:, 2], 0.0, atol=self.boundary_tol)] = 1
-
-        physical_nodes = torch.hstack(
-            [coords, forces, mask, torch.zeros((num_nodes, 1))]
-        )
-        virtual_nodes = self._make_virtual_nodes(loads)
-        return torch.vstack([physical_nodes, virtual_nodes])
-
-    def _make_virtual_nodes(
-        self, loads: list[tuple[np.ndarray, np.ndarray]]
-    ) -> torch.Tensor:
-        # Virtual nodes for contacts; # (n_v, 3)
-        ps = torch.tensor(np.stack([p for p, _ in loads]), dtype=torch.float32)
-        fs = torch.tensor(np.stack([f for _, f in loads]), dtype=torch.float32)
-        is_boundary = (
-            torch.isclose(ps[:, 2], torch.zeros(len(loads)), atol=self.boundary_tol)
-            .float()
-            .unsqueeze(1)
-        )
-        virtual_flag = torch.ones(len(loads), 1)
-        return torch.cat([ps, fs, is_boundary, virtual_flag], dim=1)
-
-    def _make_virtual_edges(
-        self, mesh: meshio.Mesh, contacts: list[tuple[np.ndarray, np.ndarray]]
-    ) -> torch.Tensor:
-        # Create virtual edges from virtual nodes to their corresponding physical nodes
-        n_phys = mesh.points.shape[0]
-        n_virtual = len(contacts)
-        p = torch.arange(n_phys, dtype=torch.long)
-        v = torch.arange(n_phys, n_phys + n_virtual, dtype=torch.long)
-
-        # Each virtual node connects to every physical node: (n_virtual * n_phys,)
-        v_rep = v.repeat_interleave(n_phys)
-        p_tiled = p.repeat(n_virtual)
-
-        edge_index = torch.stack([v_rep, p_tiled], dim=0)  # (2, n_virtual * n_phys)
-
-        # Match base edge features: [dx, dy, dz, distance] for directed edges.
-        phys_coords = torch.as_tensor(mesh.points, dtype=torch.float32)
-        virt_coords = torch.from_numpy(np.stack([p for p, _ in contacts])).float()
-        all_coords = torch.vstack([phys_coords, virt_coords])
-
-        src, dst = edge_index
-        disp = all_coords[dst] - all_coords[src]
-        dist = torch.norm(disp, dim=1, keepdim=True)
-        edge_attr = torch.hstack([disp, dist])
-
-        return edge_index, edge_attr
-
-
-class GraphVisualizer:
-    def __init__(self, mesh: trimesh.Trimesh, jupyter_backend: bool = True):
-        self.mesh = mesh
-        self.pv_mesh = pv.wrap(mesh)
-        self.jupyter_backend = jupyter_backend
-
     @staticmethod
-    def _default_scalar_bar_args() -> dict:
-        return {
-            "vertical": True,
-            "position_x": 0.84,
-            "position_y": 0.1,
-            "width": 0.08,
-            "height": 0.8,
-        }
-
-    @staticmethod
-    def _graph_contacts(graph: Data) -> list[tuple[np.ndarray, np.ndarray]]:
-        contacts = getattr(graph, "contacts", None)
-        if contacts is None:
-            return []
-        return list(contacts)
-
-    def _mesh_scale(self, ratio: float = 0.1) -> float:
-        x_min, x_max, y_min, y_max, z_min, z_max = self.pv_mesh.bounds
-        return max(x_max - x_min, y_max - y_min, z_max - z_min) * ratio
-
-    def _add_contact_vectors(
-        self,
-        plotter: pv.Plotter,
+    def _virtual_nodes(
         contacts: list[tuple[np.ndarray, np.ndarray]],
-        arrow_scale: float,
-        sphere_radius: float | None = None,
-        debug: bool = False,
-    ) -> None:
-        for point, force in contacts:
-            if debug:
-                print(f"Contact point: {point}, Force: {force}")
-
-            if sphere_radius is not None:
-                sphere = pv.Sphere(radius=sphere_radius)
-                sph = sphere.translate(point, inplace=False)
-                plotter.add_mesh(sph, color="red", opacity=1)
-
-            arrow = pv.Arrow(
-                start=np.asarray(point), direction=np.asarray(force), scale=arrow_scale
-            )
-            plotter.add_mesh(arrow, color="red")
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        points = torch.as_tensor(
+            np.stack([point for point, _ in contacts]), dtype=torch.float32
+        )
+        forces = torch.as_tensor(
+            np.stack([force for _, force in contacts]), dtype=torch.float32
+        )
+        boundary = torch.zeros((len(contacts), 1), dtype=torch.float32)
+        is_virtual = torch.ones((len(contacts), 1), dtype=torch.float32)
+        return torch.hstack((points, forces, boundary, is_virtual)), points
 
     @staticmethod
-    def _save_html_or_show(plotter: pv.Plotter, save_path: str | Path | None) -> None:
-        if save_path is not None:
-            plotter.export_html(str(save_path))
-        else:
-            plotter.show()
+    def _virtual_edges(
+        physical_pos: torch.Tensor,
+        virtual_pos: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_physical = physical_pos.shape[0]
+        num_virtual = virtual_pos.shape[0]
 
-    def plot_field(
-        self,
-        graph: Data,
-        field_data: torch.Tensor,
-        field_name: str,
-        save_path: str | Path | None = None,
-        cmap: str = "Oranges",
-        clim: tuple | None = None,
-        scalar_bar_args: dict | None = None,
-        show_contacts: bool = True,
-        clip_bottom: bool = False,
-        debug: bool = False,
-    ):
-        """Unified plotting pipeline for scalar or vector fields on graph nodes."""
-        pv_mesh = self.pv_mesh.copy()
-        pv_mesh.point_data[field_name] = field_data
-
-        if clip_bottom:
-            pv_mesh = self.pv_mesh.clip(normal=(0, 0, 1), origin=(0, 0, 1e-6))
-
-        # Configure PyVista plotter
-        plotter = pv.Plotter(notebook=self.jupyter_backend, off_screen=True)
-        plotter.add_mesh(
-            pv_mesh,
-            scalars=field_name,
-            point_size=1,
-            render_points_as_spheres=True,
-            show_edges=True,
-            clim=clim,
-            scalar_bar_args=scalar_bar_args or self._default_scalar_bar_args(),
-            cmap=cmap,
+        physical_index = torch.arange(num_physical, dtype=torch.long)
+        virtual_index = torch.arange(
+            num_physical, num_physical + num_virtual, dtype=torch.long
         )
 
-        # Optional contacts rendering
-        if show_contacts:
-            contacts = self._graph_contacts(graph)
-            if len(contacts) > 0:
-                scale = self._mesh_scale(ratio=0.1)
-                self._add_contact_vectors(
-                    plotter,
-                    contacts=contacts,
-                    arrow_scale=scale,
-                    sphere_radius=scale * 0.1,
-                    debug=debug,
-                )
+        virtual_repeated = virtual_index.repeat_interleave(num_physical)
+        physical_tiled = physical_index.repeat(num_virtual)
 
-        plotter.show_axes()
-        self._save_html_or_show(plotter, save_path=save_path)
-        return plotter
-
-    def von_mises(
-        self,
-        graph: Data,
-        save_path: str | None = None,
-        cmap: str = "Oranges",
-        clim: tuple | None = None,
-        scalar_bar_args: dict | None = None,
-        show_contacts: bool = False,
-        clip_bottom: bool = False,
-        debug: bool = False,
-    ):
-        n_phys = graph.num_physical_nodes
-        stress = graph.y[:n_phys, 3:9]
-        vm = calculate_von_mises(stress).detach().cpu().numpy()
-        return self.plot_field(
-            graph=graph,
-            field_data=vm,
-            field_name="von Mises [Pa]",
-            save_path=save_path,
-            cmap=cmap,
-            clim=clim,
-            scalar_bar_args=scalar_bar_args,
-            show_contacts=show_contacts,
-            clip_bottom=clip_bottom,
-            debug=debug,
+        # Bidirectional virtual/physical edges.
+        edge_index = torch.hstack(
+            (
+                torch.stack((virtual_repeated, physical_tiled)),
+                torch.stack((physical_tiled, virtual_repeated)),
+            )
         )
 
-    def displacement(
-        self,
-        graph: Data,
-        cmap: str = "Oranges",
-        clim: tuple | None = None,
-        show_contacts: bool = False,
-        save_path: str | Path | None = None,
-        scalar_bar_args: dict | None = None,
-        scale: float = 1e9,
-        debug: bool = False,
-    ):
-        n_phys = graph.num_physical_nodes
-        clim = (clim[0] * scale, clim[1] * scale) if clim is not None else None
-        disp = graph.y.detach().cpu().numpy()[:n_phys, :3] * scale
-        return self.plot_field(
-            graph=graph,
-            field_data=disp,
-            field_name=f"displacement [{1 / scale:.1e} m]",
-            save_path=save_path,
-            cmap=cmap,
-            clim=clim,
-            scalar_bar_args=scalar_bar_args,
-            show_contacts=show_contacts,
-            debug=debug,
+        all_pos = torch.vstack((physical_pos, virtual_pos))
+        src, dst = edge_index
+        displacement = all_pos[dst] - all_pos[src]
+        distance = torch.linalg.vector_norm(displacement, dim=1, keepdim=True)
+        return edge_index, torch.hstack((displacement, distance))
+
+
+def generate_graph_dataset(
+    raw_path: Path,
+    out_path: Path,
+    builder_kind: str = "base",
+    num_samples: int | None = None,
+) -> None:
+    with np.load(raw_path, allow_pickle=False) as raw:
+        vertices = raw["vertices"]
+        tetra = raw["tetra"]
+        boundary_mask = raw["boundary_mask"]
+        contact_points = raw["contact_points"]
+        contact_forces = raw["contact_forces"]
+        vertex_forces = raw["vertex_forces"]
+        vertex_displacement = raw["vertex_displacement"]
+        vertex_stress = raw["vertex_stress"]
+        mesh_path = raw["mesh_path"].item() if "mesh_path" in raw else None
+        schema_version = int(raw["schema_version"]) if "schema_version" in raw else 0
+
+    if schema_version != 2:
+        raise ValueError(
+            f"Expected raw schema version 2, got {schema_version}. Regenerate FEM data."
         )
 
-    def force(
-        self,
-        graph: Data,
-        cmap: str = "Oranges",
-        save_path: str | Path | None = None,
-        scalar_bar_args: dict | None = None,
-        debug: bool = False,
-    ):
-        n_phys = graph.num_physical_nodes
-        force = graph.x[:n_phys, 3:6].norm(dim=1).detach().cpu().numpy()[:n_phys]
-        return self.plot_field(
-            graph=graph,
-            field_data=force,
-            field_name="force",
-            save_path=save_path,
-            cmap=cmap,
-            scalar_bar_args=scalar_bar_args,
-            show_contacts=True,
-            debug=debug,
+    template = MeshGraphTemplate.from_arrays(vertices, tetra, boundary_mask)
+    num_contacts = int(contact_points.shape[1])
+    builders = {
+        "base": GraphBuilderBase(),
+        "augment": GraphBuilderAugment(num_contacts),
+        "virtual": GraphBuilderVirtual(),
+    }
+    try:
+        builder = builders[builder_kind]
+    except KeyError as error:
+        raise ValueError(f"Unknown builder kind: {builder_kind}") from error
+
+    available = int(contact_points.shape[0])
+    count = available if num_samples is None else min(num_samples, available)
+
+    graphs: list[Data] = []
+    for index in range(count):
+        contacts = list(zip(contact_points[index], contact_forces[index]))
+        graphs.append(
+            builder.build(
+                template,
+                vertex_forces[index],
+                vertex_displacement[index],
+                vertex_stress[index],
+                contacts,
+            )
         )
 
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Generate graphs from FEM data.")
-    parser.add_argument(
-        "filepath",
-        type=Path,
-        nargs="+",
-        help="Path to the raw .npz data file or directory.",
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "params": {
+                "node_dim": builder.node_dim,
+                "edge_dim": builder.edge_dim,
+                "output_dim": 9,
+                "num_categorical": builder.num_categorical,
+                "builder_kind": builder_kind,
+            },
+            "graphs": graphs,
+            "mesh_path": mesh_path,
+            "source_path": str(raw_path),
+            "schema_version": 2,
+        },
+        out_path,
     )
-    parser.add_argument(
-        "--out_dir",
-        type=Path,
-        default=Path("data"),
-        help="Output directory for saving the generated graphs.",
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build graphs from saved vertex-aligned FEM data."
     )
+    parser.add_argument("filepath", type=Path, nargs="+")
+    parser.add_argument("--out_dir", type=Path, default=Path("data/graphs"))
+    parser.add_argument("--num_samples", type=int, default=None)
     parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=None,
-        help="Number of samples to generate from the raw .npz file.",
+        "--builder",
+        choices=("base", "augment", "virtual"),
+        default="virtual",
     )
     return parser.parse_args()
 
 
-def main():
+def main() -> None:
     args = parse_args()
-    builder = GraphBuilderVirtual(std=0.01)
-
-    files = []
+    files: list[Path] = []
     for path in args.filepath:
         if path.is_file():
             files.append(path)
         elif path.is_dir():
-            files.extend(path.glob("*.npz"))
+            files.extend(sorted(path.glob("*.npz")))
         else:
             raise RuntimeError(f"Path {path} is not a file or directory.")
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-
-    for f in files:
-        out_path = args.out_dir / f.with_suffix(".pt").name
-        builder.generate_graph_dataset(f, out_path, num_samples=args.num_samples)
+    for filepath in files:
+        out_path = args.out_dir / filepath.with_suffix(".pt").name
+        generate_graph_dataset(
+            filepath,
+            out_path,
+            builder_kind=args.builder,
+            num_samples=args.num_samples,
+        )
         print(f"Saved graph dataset to {out_path}")
 
 

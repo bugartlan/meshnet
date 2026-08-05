@@ -6,9 +6,8 @@ from typing import Any, TypeAlias
 import basix.ufl
 import numpy as np
 import numpy.typing as npt
-import pyvista
 import ufl
-from dolfinx import default_scalar_type, fem, geometry, mesh, plot
+from dolfinx import default_scalar_type, fem, mesh
 from dolfinx.fem.petsc import apply_lifting, assemble_matrix, assemble_vector, set_bc
 from dolfinx.mesh import create_mesh
 from mpi4py import MPI
@@ -18,14 +17,10 @@ from scipy.spatial import KDTree
 from meshnet.utils.geodesics import SurfaceGeodesics
 from meshnet.utils.mesh import Mesh
 
-YOUNG_MODULUS = 2.0e9
-POISSON_RATIO = 0.35
 BOUNDARY_TOLERANCE = 1e-6
-PROJECTION_BISECTION_STEPS = 24
 
 Load: TypeAlias = tuple[npt.ArrayLike, npt.ArrayLike]
 MeshSource: TypeAlias = Mesh | str | PathLike[str]
-ProjectionKey: TypeAlias = tuple[str, int, tuple[int, ...]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,35 +30,53 @@ class IsotropicMaterial:
 
     @property
     def lame_mu(self) -> float:
-        """Second Lamé parameter (mu)"""
-        return self.young_modulus / (2 * (1 + self.poisson_ratio))
+        return self.young_modulus / (2.0 * (1.0 + self.poisson_ratio))
 
     @property
     def lame_lambda(self) -> float:
-        """First Lamé parameter (lambda)"""
-        return (
-            self.young_modulus
-            * self.poisson_ratio
-            / ((1 + self.poisson_ratio) * (1 - 2 * self.poisson_ratio))
-        )
+        nu = self.poisson_ratio
+        return self.young_modulus * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True)
+class SimulationResult:
+    """One FEM solve and its graph-aligned P1 vertex outputs.
+
+    All three arrays use exactly the source mesh vertex order.
+    """
+
+    displacement_fem: fem.Function  # P2 solution used by FEM
+
+    displacement_vertices: np.ndarray  # [num_vertices, 3]
+    stress_vertices: np.ndarray  # [num_vertices, 6]
+    nodal_forces_vertices: np.ndarray  # [num_vertices, 3]
+
+    @property
+    def targets(self) -> np.ndarray:
+        """Graph target matrix: [ux, uy, uz, sxx, syy, szz, sxy, syz, sxz]."""
+        return np.hstack((self.displacement_vertices, self.stress_vertices))
+
+
+@dataclass(frozen=True, slots=True)
 class _ProjectionSystem:
-    function_space: Any
-    test_function: Any
-    mass_matrix: Any
+    space: Any
+    test: Any
+    mass_matrix: PETSc.Mat
     solver: PETSc.KSP
 
 
-@dataclass
-class SimulationResult:
-    displacement: fem.Function
-    nodal_forces: np.ndarray  # [num_nodes, 3]
-
-
 class Simulator:
-    """Small-strain linear-elastic FEM solver for distributed contact loads."""
+    """P2 linear-elastic solve with P1 vertex-aligned exported fields.
+
+    The solve space and output spaces intentionally have different roles:
+      * V_solve: CG(order), normally CG2, for accurate displacement solves.
+      * V_vertex: CG1 vector space for displacement export and nodal loads.
+      * S_vertex: CG1 six-vector space for recovered continuous stress.
+
+    Dataset export currently assumes a serial DOLFINx run because a graph needs
+    one complete global vertex array. For MPI solves, gather owned vertex data
+    to rank zero before writing the dataset.
+    """
 
     def __init__(
         self,
@@ -71,54 +84,58 @@ class Simulator:
         *,
         order: int = 2,
         contact_std: float = 0.001,
-        material: IsotropicMaterial = None,
+        material: IsotropicMaterial | None = None,
         geodesics: SurfaceGeodesics | None = None,
         comm: MPI.Comm = MPI.COMM_WORLD,
     ) -> None:
+        if order < 1:
+            raise ValueError(f"order must be at least 1, got {order}")
+        if contact_std <= 0.0:
+            raise ValueError(f"contact_std must be positive, got {contact_std}")
+        if comm.size != 1:
+            raise NotImplementedError(
+                "Graph-aligned global vertex export is implemented for serial "
+                "dataset generation. Add an MPI gather for distributed runs."
+            )
+
         self.comm = comm
         self.order = order
         self.contact_std = contact_std
         self.material = material or IsotropicMaterial()
 
         source_mesh = self._load_mesh(obj_mesh)
-        self._source_points = np.asarray(source_mesh.volume.points).copy()
+        self.source_points = np.asarray(
+            source_mesh.volume.points, dtype=np.float64
+        ).copy()
+        self.source_tetra = np.asarray(
+            source_mesh.volume.cells_dict["tetra"], dtype=np.int64
+        ).copy()
 
-        self.domain = self._create_domain(source_mesh)
-<<<<<<< HEAD
+        self.domain = self._create_domain(self.source_points, self.source_tetra)
         self.gdim = self.domain.geometry.dim
         self.cdim = self.domain.topology.dim
         self.fdim = self.cdim - 1
 
-        self.V = fem.FunctionSpace(self.domain, ("Lagrange", self.order, (self.gdim,)))
-=======
-        self.gdim = self.domain.geometry.dim  # coordinate space
-        self.cdim = self.domain.topology.dim  # cell dimension (tetra=3)
-        self.fdim = self.cdim - 1
+        # High-order solve space.
+        self.V_solve = fem.functionspace(
+            self.domain, ("Lagrange", self.order, (self.gdim,))
+        )
 
-        self.V = fem.functionspace(self.domain, ("Lagrange", self.order, (self.gdim,)))
->>>>>>> c2ce5de04b18df150b4e56818801e7c3418a2632
+        # P1 spaces whose block DOFs correspond to mesh vertices.
+        self.V_vertex = fem.functionspace(self.domain, ("Lagrange", 1, (self.gdim,)))
+        self.S_vertex = fem.functionspace(self.domain, ("Lagrange", 1, (6,)))
+
+        self._vertex_dofs_u = self._map_source_vertices_to_block_dofs(self.V_vertex)
+        self._vertex_dofs_s = self._map_source_vertices_to_block_dofs(self.S_vertex)
 
         self._surface_geodesics = geodesics or SurfaceGeodesics.from_mesh(
             source_mesh, tolerance=BOUNDARY_TOLERANCE
         )
-
-        self.bc = self._create_fixed_bc()
-
-<<<<<<< HEAD
-=======
-        self.a, self.K, self.solver = self._create_elasticity_system()
-
->>>>>>> c2ce5de04b18df150b4e56818801e7c3418a2632
-        self._projection_systems: dict[ProjectionKey, _ProjectionSystem] = {}
-        self._dof_trees: dict[int, tuple[Any, KDTree]] = {}
-        self._mesh_point_dofs: dict[int, tuple[Any, np.ndarray]] = {}
-        self._create_geom_search_structs()
         self._prepare_geodesic_distance_field()
 
-        (
-            self._mesh_eval_points,
-            self._mesh_eval_cells,
-        ) = self._prepare_mesh_point_evaluation()
+        self.bc = self._create_fixed_bc()
+        self.a, self.K, self.solver = self._create_elasticity_system()
+        self._stress_projection = self._create_projection_system(self.S_vertex)
 
     @staticmethod
     def _load_mesh(source: MeshSource) -> Mesh:
@@ -126,10 +143,7 @@ class Simulator:
             return source
         return Mesh.read(str(source))
 
-    def _create_domain(self, source_mesh: Mesh) -> mesh.Mesh:
-        points = np.asarray(source_mesh.volume.points)
-        tetras = source_mesh.volume.cells_dict["tetra"]
-
+    def _create_domain(self, points: np.ndarray, tetra: np.ndarray) -> mesh.Mesh:
         coordinate_element = basix.ufl.element(
             "Lagrange",
             "tetrahedron",
@@ -137,502 +151,273 @@ class Simulator:
             shape=(points.shape[1],),
         )
         ufl_domain = ufl.Mesh(coordinate_element)
+        return create_mesh(self.comm, tetra, points, ufl_domain)
 
-        return create_mesh(
-            self.comm,
-            tetras,
-            points,
-            ufl_domain,
-        )
+    def _map_source_vertices_to_block_dofs(self, space: Any) -> np.ndarray:
+        """Map source mesh vertex order to a CG1 blocked-space DOF order."""
+        coordinates = np.asarray(space.tabulate_dof_coordinates(), dtype=np.float64)
+        if coordinates.ndim != 2 or coordinates.shape[1] != self.gdim:
+            raise RuntimeError(
+                f"Unexpected DOF-coordinate shape for vertex space: {coordinates.shape}"
+            )
+
+        distances, indices = KDTree(coordinates).query(self.source_points, k=1)
+        tolerance = max(BOUNDARY_TOLERANCE, 1e-10 * self._mesh_scale())
+
+        if np.any(distances > tolerance):
+            raise RuntimeError(
+                "Could not align source vertices with CG1 DOFs. "
+                f"Maximum mismatch is {float(np.max(distances)):.3e}."
+            )
+        if np.unique(indices).size != self.source_points.shape[0]:
+            raise RuntimeError(
+                "Source vertex coordinates are duplicated or multiple vertices "
+                "mapped to the same CG1 DOF."
+            )
+
+        return np.asarray(indices, dtype=np.intp)
+
+    def _mesh_scale(self) -> float:
+        extent = np.ptp(self.source_points, axis=0)
+        return float(max(np.max(extent), 1.0))
 
     def _create_fixed_bc(self) -> fem.DirichletBC:
         boundary_facets = mesh.locate_entities_boundary(
             self.domain,
             self.fdim,
-            lambda x: np.isclose(
-                x[2],
-                0.0,
-                atol=BOUNDARY_TOLERANCE,
-                rtol=0.0,
-            ),
+            lambda x: np.isclose(x[2], 0.0, atol=BOUNDARY_TOLERANCE, rtol=0.0),
         )
-        boundary_dofs = fem.locate_dofs_topological(self.V, self.fdim, boundary_facets)
-        zeros = np.zeros(self.gdim, dtype=default_scalar_type)
-        return fem.dirichletbc(zeros, boundary_dofs, self.V)
+        boundary_dofs = fem.locate_dofs_topological(
+            self.V_solve, self.fdim, boundary_facets
+        )
+        value = np.zeros(self.gdim, dtype=default_scalar_type)
+        return fem.dirichletbc(value, boundary_dofs, self.V_solve)
 
     @staticmethod
     def epsilon(u: Any) -> Any:
-        """Infinitesimal strain ε(u) = sym(grad(u))."""
         return ufl.sym(ufl.grad(u))
 
     def sigma(self, u: Any) -> Any:
-        """Isotropic Cauchy stress σ(u)."""
         strain = self.epsilon(u)
-
         return (
             2.0 * self.material.lame_mu * strain
             + self.material.lame_lambda * ufl.tr(strain) * ufl.Identity(self.gdim)
         )
 
-    def _create_elasticity_system(self) -> tuple[Any, PETSc.Mat, PETSc.KSP]:
-        """Assemble the linear system for the elasticity problem."""
-        u = ufl.TrialFunction(self.V)
-        v = ufl.TestFunction(self.V)
-
-        # a(u, v) = ∫Ω σ(u) : ε(v) dx
-        a = fem.form(ufl.inner(self.sigma(u), self.epsilon(v)) * ufl.dx)
-
-        # stiffness matrix
-        K = assemble_matrix(a, bcs=[self.bc])
-        K.assemble()
-
-        solver = self._create_direct_solver(K, factor_solver="mumps")
-
-        return a, K, solver
-
-    def _create_direct_solver(
-        self, matrix: PETSc.Mat, *, factor_solver: str | None = None
-    ) -> PETSc.KSP:
-        solver = PETSc.KSP().create(self.comm)
-        solver.setOperators(matrix)
-        solver.setType(PETSc.KSP.Type.PREONLY)
-
-        preconditioner = solver.getPC()
-        preconditioner.setType(PETSc.PC.Type.LU)
-        if factor_solver is not None:
-            preconditioner.setFactorSolverType(factor_solver)
-
-        return solver
-
-    def _create_geom_search_structs(self) -> None:
-        self.domain.topology.create_connectivity(self.fdim, self.cdim)
-
-        cell_map = self.domain.topology.index_map(self.cdim)
-        n_local_cells = cell_map.size_local + cell_map.num_ghosts
-
-        self._cell_indices = np.arange(n_local_cells, dtype=np.int32)
-
-        self._bounding_box_tree = geometry.bb_tree(
-            self.domain, self.cdim, self._cell_indices
-        )
-
-        self._cell_midpoint_tree = geometry.create_midpoint_tree(
-            self.domain, self.cdim, self._cell_indices
-        )
-
-    def _prepare_geodesic_distance_field(self) -> None:
-        self._geodesic_space = fem.functionspace(self.domain, ("Lagrange", 1))
-
-        dof_coordinates = self._geodesic_space.tabulate_dof_coordinates()
-        surface_tree = KDTree(self._surface_geodesics.vertices)
-
-        nearest_surface_vertices = surface_tree.query(dof_coordinates, k=1)[1]
-
-        self._geodesic_dof_surface_vertices = np.asarray(
-            nearest_surface_vertices, dtype=np.intp
-        )
-
-    def _geodesic_distance_field(self, point: np.ndarray) -> fem.Function:
-        distances = self._surface_geodesics.distance_from(point)
-
-        distance_field = fem.Function(self._geodesic_space)
-        distance_field.x.array[:] = distances[
-            self._geodesic_dof_surface_vertices
-        ].astype(distance_field.x.array.dtype, copy=False)
-        distance_field.x.scatter_forward()
-
-        return distance_field
-
-    def _traction(self, point: np.ndarray, force: np.ndarray) -> fem.Function:
-        distance_field = self._geodesic_distance_field(point)
-        weight = ufl.exp(-(distance_field**2) / (2 * self.contact_std**2))
-
-        local_integral = fem.assemble_scalar(fem.form(weight * ufl.ds))
-        normalization = self.comm.allreduce(local_integral, op=MPI.SUM)
-        return (
-            fem.Constant(
-                self.domain,
-                default_scalar_type(force / normalization),
-            )
-            * weight
-        )
-
-    @staticmethod
-    def _accumulate_ghost_values(
-        vector: PETSc.Vec,
-        *,
-        populate_ghosts: bool = False,
-    ) -> None:
-        vector.ghostUpdate(
-            addv=PETSc.InsertMode.ADD_VALUES,
-            mode=PETSc.ScatterMode.REVERSE,
-        )
-
-        if populate_ghosts:
-            vector.ghostUpdate(
-                addv=PETSc.InsertMode.INSERT_VALUES,
-                mode=PETSc.ScatterMode.FORWARD,
-            )
-
-    def run(self, loads: Iterable[Load]) -> SimulationResult:
-        """Solve for displacement under the supplied point-force pairs.
-
-        Args:
-            loads: An iterable of (point, force) pairs. Each point must be a 3D coordinate on the mesh surface, and each force must be a 3D vector.
-
-        Returns:
-            SimulationResult: Contains the displacement field and nodal forces.
-        """
-        zero_traction = fem.Constant(
-            self.domain,
-<<<<<<< HEAD
-            np.zeros(
-                self.geometric_dimension,
-                dtype=default_scalar_type,
-            ),
-=======
-            np.zeros(self.gdim, dtype=default_scalar_type),
->>>>>>> c2ce5de04b18df150b4e56818801e7c3418a2632
-        )
-        v = ufl.TestFunction(self.V)
-
-        load_form = ufl.dot(zero_traction, v) * ufl.dx
-
-        load_form = ufl.dot(zero_traction, self.v) * ufl.dx
-
-        for point, force in loads:
-            traction = self._traction(point, force)
-<<<<<<< HEAD
-            load_form += ufl.dot(traction, self.v) * ufl.ds
-=======
-            load_form += ufl.dot(traction, v) * ufl.ds
->>>>>>> c2ce5de04b18df150b4e56818801e7c3418a2632
-
-        rhs = assemble_vector(fem.form(load_form))
-
-        # Preserve a copy before lifting and Dirichlet conditions are applied
-        external_load = rhs.copy()
-        self._accumulate_ghost_values(
-            external_load,
-            populate_ghosts=True,
-        )
-
-<<<<<<< HEAD
-        apply_lifting(rhs, [self.K], bcs=[[self.bc]])
-=======
-        apply_lifting(rhs, [self.a], bcs=[[self.bc]])
->>>>>>> c2ce5de04b18df150b4e56818801e7c3418a2632
-        self._accumulate_ghost_values(rhs, populate_ghosts=True)
-        set_bc(rhs, [self.bc])
-
-        displacement = fem.Function(self.V)
-        self.solver.solve(rhs, displacement.x.petsc_vec)
-        displacement.x.scatter_forward()
-
-        external_load_dofs = (
-            np.asarray(external_load.array.real, dtype=np.float64)
-            .reshape(-1, self.gdim)
-            .copy()
-        )
-
-        return SimulationResult(
-            displacement=displacement,
-            nodal_forces=external_load_dofs,
-        )
-
-    def _get_projection_system(
-        self,
-        family: str,
-        degree: int,
-        shape: tuple[int, ...] = (),
-    ) -> _ProjectionSystem:
-        key = (family, degree, shape)
-
-        cached = self._projection_systems.get(key)
-        if cached is not None:
-            return cached
-
-        element = (family, degree) if not shape else (family, degree, shape)
-        function_space = fem.functionspace(self.domain, element)
-        u = ufl.TestFunction(function_space)
-        v = ufl.TrialFunction(function_space)
-        mass_form = fem.form(ufl.inner(u, v) * ufl.dx)
-        mass_matrix = assemble_matrix(mass_form)
-        mass_matrix.assemble()
-
-        system = _ProjectionSystem(
-            function_space=function_space,
-            test_function=u,
-            mass_matrix=mass_matrix,
-            solver=self._create_direct_solver(mass_matrix, factor_solver="mumps"),
-        )
-        self._projection_systems[key] = system
-
-        return system
-
-    def _project(
-        self, expression: Any, family: str, degree: int, shape: tuple[int, ...] = ()
-    ) -> fem.Function:
-        system = self._get_projection_system(family, degree, shape)
-        rhs = assemble_vector(
-            fem.form(ufl.inner(expression, system.test_function) * ufl.dx)
-        )
-        self._accumulate_ghost_values(rhs, populate_ghosts=True)
-
-        result = fem.Function(system.function_space)
-        system.solver.solve(rhs, result.x.petsc_vec)
-        result.x.scatter_forward()
-
-        return result
-
-    def stress_voigt(self, displacement: fem.Function) -> fem.Function:
-        """[xx, yy, zz, xy, yz, xz]"""
+    def stress_voigt(self, displacement: fem.Function) -> Any:
         stress = self.sigma(displacement)
         return ufl.as_vector(
-            [
+            (
                 stress[0, 0],
                 stress[1, 1],
                 stress[2, 2],
                 stress[0, 1],
                 stress[1, 2],
                 stress[0, 2],
-            ]
-        )
-
-    def compute_stress(self, displacement: fem.Function, degree: int) -> fem.Function:
-        """Project stress onto a continuous Lagrange space.
-
-        A continuous projection gives each mesh vertex one unambiguous stress
-        value. This is required for node-based graph targets: evaluating a
-        discontinuous stress field at a shared vertex otherwise selects an
-        arbitrary adjacent cell's value.
-        """
-        sigma_voigt = self.stress_voigt(displacement)
-        return self._project(
-            sigma_voigt,
-            family="Lagrange",
-            degree=degree,
-            shape=(6,),
-        )
-
-    def _colliding_cell_indices(
-        self, points: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        candidates = geometry.compute_collisions_points(self._bounding_box_tree, points)
-        collisions = geometry.compute_colliding_cells(self.domain, candidates, points)
-
-        point_indices: list[int] = []
-        cell_indices: list[int] = []
-        for i in range(len(points)):
-            cells = collisions.links(i)
-            if len(cells):
-                point_indices.append(i)
-                cell_indices.append(cells[0])
-
-        return (
-            np.asarray(point_indices, dtype=np.int32),
-            np.asarray(cell_indices, dtype=np.int32),
-        )
-
-    def _prepare_mesh_point_evaluation(self) -> tuple[np.ndarray, np.ndarray]:
-        """Cache evaluation coordinates and cells for the volume-mesh points."""
-        evaluation_points = self._source_points.copy()
-        evaluation_cells = np.full(len(self._source_points), -1, dtype=np.int32)
-
-        point_indices, cell_indices = self._colliding_cell_indices(self._source_points)
-        evaluation_cells[point_indices] = cell_indices
-
-        missing_indices = np.flatnonzero(evaluation_cells < 0)
-        if missing_indices.size:
-            projected_indices, projected_points, projected_cells = self._project_inside(
-                self._source_points[missing_indices]
             )
-            resolved_indices = missing_indices[projected_indices]
-            evaluation_points[resolved_indices] = projected_points
-            evaluation_cells[resolved_indices] = projected_cells
+        )
 
-        return evaluation_points, evaluation_cells
+    def _create_elasticity_system(self) -> tuple[Any, PETSc.Mat, PETSc.KSP]:
+        trial = ufl.TrialFunction(self.V_solve)
+        test = ufl.TestFunction(self.V_solve)
+        bilinear = fem.form(ufl.inner(self.sigma(trial), self.epsilon(test)) * ufl.dx)
 
-    def _project_inside(
-        self, points: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Move outside points to the domain boundary from an interior anchor.
+        matrix = assemble_matrix(bilinear, bcs=[self.bc])
+        matrix.assemble()
+        return bilinear, matrix, self._create_direct_solver(matrix, "mumps")
 
-        The closest volume cell supplies a mapped midpoint that is inside the
-        domain. Bisection along the midpoint-to-query segment approaches the
-        boundary without requiring a separate triangulated surface.
+    def _create_projection_system(self, space: Any) -> _ProjectionSystem:
+        trial = ufl.TrialFunction(space)
+        test = ufl.TestFunction(space)
+        mass_form = fem.form(ufl.inner(trial, test) * ufl.dx)
+        mass_matrix = assemble_matrix(mass_form)
+        mass_matrix.assemble()
+        return _ProjectionSystem(
+            space=space,
+            test=test,
+            mass_matrix=mass_matrix,
+            solver=self._create_direct_solver(mass_matrix, "mumps"),
+        )
 
-        Returns:
-            Indices of successfully projected input points, their projected
-            coordinates, and the cells containing those coordinates.
-        """
-        if not len(points):
-            empty_indices = np.empty(0, dtype=np.int32)
-            empty_points = np.empty((0, self.domain.geometry.dim))
-            return empty_indices, empty_points, empty_indices
+    def _create_direct_solver(
+        self, matrix: PETSc.Mat, factor_solver: str | None = None
+    ) -> PETSc.KSP:
+        solver = PETSc.KSP().create(self.comm)
+        solver.setOperators(matrix)
+        solver.setType(PETSc.KSP.Type.PREONLY)
+        pc = solver.getPC()
+        pc.setType(PETSc.PC.Type.LU)
+        if factor_solver is not None:
+            pc.setFactorSolverType(factor_solver)
+        return solver
 
-        closest_cells = geometry.compute_closest_entity(
-            self._bounding_box_tree,
-            self._cell_midpoint_tree,
+    def _prepare_geodesic_distance_field(self) -> None:
+        self._geodesic_space = fem.functionspace(self.domain, ("Lagrange", 1))
+        dof_coordinates = self._geodesic_space.tabulate_dof_coordinates()
+        surface_tree = KDTree(self._surface_geodesics.vertices)
+        nearest = surface_tree.query(dof_coordinates, k=1)[1]
+        self._geodesic_dof_surface_vertices = np.asarray(nearest, dtype=np.intp)
+
+    def _geodesic_distance_field(self, point: np.ndarray) -> fem.Function:
+        distances = self._surface_geodesics.distance_from(point)
+        field = fem.Function(self._geodesic_space)
+        field.x.array[:] = distances[self._geodesic_dof_surface_vertices].astype(
+            field.x.array.dtype, copy=False
+        )
+        field.x.scatter_forward()
+        return field
+
+    def _traction(self, point: np.ndarray, force: np.ndarray) -> Any:
+        distance = self._geodesic_distance_field(point)
+        weight = ufl.exp(-(distance**2) / (2.0 * self.contact_std**2))
+
+        local_integral = fem.assemble_scalar(fem.form(weight * ufl.ds))
+        normalization = self.comm.allreduce(local_integral, op=MPI.SUM)
+        if not np.isfinite(normalization) or normalization <= 0.0:
+            raise RuntimeError("Contact traction normalization failed.")
+
+        force_constant = fem.Constant(
             self.domain,
-            points,
+            default_scalar_type(force / normalization),
         )
-        projectable_indices = np.flatnonzero(closest_cells >= 0).astype(np.int32)
-        if not projectable_indices.size:
-            empty_points = np.empty((0, self.domain.geometry.dim))
-            return projectable_indices, empty_points, projectable_indices
+        return force_constant * weight
 
-        cell_dimension = self.domain.topology.dim
-        inside_points = mesh.compute_midpoints(
-            self.domain,
-            cell_dimension,
-            closest_cells[projectable_indices],
-        )
-
-        # A highly distorted curved element can have an unusable geometric
-        # midpoint. Keep only anchors that DOLFINx confirms are inside.
-        valid_anchor_indices, anchor_cells = self._colliding_cell_indices(inside_points)
-        projectable_indices = projectable_indices[valid_anchor_indices]
-        inside_points = inside_points[valid_anchor_indices]
-        if not projectable_indices.size:
-            return projectable_indices, inside_points, anchor_cells
-
-        outside_points = points[projectable_indices].copy()
-        containing_cells = anchor_cells.copy()
-        for _ in range(PROJECTION_BISECTION_STEPS):
-            candidates = 0.5 * (inside_points + outside_points)
-            inside_candidate_indices, candidate_cells = self._colliding_cell_indices(
-                candidates
-            )
-            candidate_is_inside = np.zeros(len(candidates), dtype=bool)
-            candidate_is_inside[inside_candidate_indices] = True
-
-            inside_points[candidate_is_inside] = candidates[candidate_is_inside]
-            containing_cells[inside_candidate_indices] = candidate_cells
-            outside_points[~candidate_is_inside] = candidates[~candidate_is_inside]
-
-        return projectable_indices, inside_points, containing_cells
-
-    def _nearest_dof_tree(self, function_space: Any) -> KDTree:
-        key = id(function_space)
-        cached = self._dof_trees.get(key)
-        if cached is None or cached[0] is not function_space:
-            cached = (
-                function_space,
-                KDTree(function_space.tabulate_dof_coordinates()),
-            )
-            self._dof_trees[key] = cached
-        return cached[1]
-
-    def evaluate_source_points(self, function: fem.Function) -> np.ndarray:
-        """Evaluate a function at the volume-mesh points using cached cells.
-
-        The geometric search is performed once when the simulator is created.
-        Any mesh point that cannot be associated with a local cell uses a
-        cached nearest degree of freedom, matching :meth:`probe`'s final
-        fallback.
-        """
-        function_space = function.function_space
-        block_size = function_space.dofmap.index_map_bs
-        values = np.zeros((len(self._source_points), block_size), dtype=np.float64)
-
-        resolved = self._mesh_eval_cells >= 0
-        if np.any(resolved):
-            values[resolved] = function.eval(
-                self._mesh_eval_points[resolved],
-                self._mesh_eval_cells[resolved],
-            )
-
-        missing_indices = np.flatnonzero(~resolved)
-        if missing_indices.size:
-            key = id(function_space)
-            cached = self._mesh_point_dofs.get(key)
-            if cached is None or cached[0] is not function_space:
-                nearest_dofs = self._nearest_dof_tree(function_space).query(
-                    self._source_points[missing_indices], k=1
-                )[1]
-                cached = (function_space, np.asarray(nearest_dofs, dtype=np.intp))
-                self._mesh_point_dofs[key] = cached
-
-            nodal_values = function.x.array.real.reshape(-1, block_size)
-            values[missing_indices] = nodal_values[cached[1]]
-
-        return values
-
-    # Visualization
+    def _build_load_form(self, space: Any, tractions: list[Any]) -> Any:
+        test = ufl.TestFunction(space)
+        zero = fem.Constant(self.domain, np.zeros(self.gdim, dtype=default_scalar_type))
+        linear = ufl.dot(zero, test) * ufl.ds
+        for traction in tractions:
+            linear += ufl.dot(traction, test) * ufl.ds
+        return fem.form(linear)
 
     @staticmethod
-    def _build_grid(function_space: Any) -> pyvista.UnstructuredGrid:
-        topology, cell_types, geometry_points = plot.vtk_mesh(function_space)
-        return pyvista.UnstructuredGrid(topology, cell_types, geometry_points)
-
-    def _render_grid(
-        self,
-        grid: pyvista.UnstructuredGrid,
-        scalar_name: str,
-        scalar_bar_title: str,
-        slice_bottom: bool = False,
-    ) -> pyvista.Plotter:
-        target = (
-            grid.slice(
-                normal="z",
-                origin=(0, 0, self.bottom_z + BOUNDARY_TOLERANCE),
+    def _accumulate_ghost_values(
+        vector: PETSc.Vec, *, populate_ghosts: bool = False
+    ) -> None:
+        vector.ghostUpdate(
+            addv=PETSc.InsertMode.ADD_VALUES,
+            mode=PETSc.ScatterMode.REVERSE,
+        )
+        if populate_ghosts:
+            vector.ghostUpdate(
+                addv=PETSc.InsertMode.INSERT_VALUES,
+                mode=PETSc.ScatterMode.FORWARD,
             )
-            if slice_bottom
-            else grid
-        )
-        plotter = pyvista.Plotter()
-        plotter.add_mesh(
-            target,
-            scalars=scalar_name,
-            show_edges=True,
-            scalar_bar_args={"title": scalar_bar_title},
-        )
-        plotter.show_axes()
-        plotter.show()
-        return plotter
 
-    def plot_displacement(self, displacement: fem.Function) -> pyvista.Plotter:
-        grid = self._build_grid(displacement.function_space)
-        grid.point_data["displacement"] = displacement.x.array.real.reshape(
-            -1, self.domain.geometry.dim
-        )
-        return self._render_grid(
-            grid,
-            scalar_name="displacement",
-            scalar_bar_title="Displacement (m)",
-        )
-
-    def plot_stress(
+    def _extract_vertex_values(
         self,
-        stress: fem.Function,
-        component: str,
-        slice_bottom: bool = False,
-    ) -> pyvista.Plotter:
-        """Plot a specific component of the stress tensor.
+        function: fem.Function,
+        source_to_dof: np.ndarray,
+    ) -> np.ndarray:
+        block_size = function.function_space.dofmap.index_map_bs
+        dof_values = np.asarray(function.x.array.real).reshape(-1, block_size)
+        return np.asarray(dof_values[source_to_dof], dtype=np.float64).copy()
 
-        Args:
-            stress: The projected stress function in Voigt notation.
-            component: The stress component to plot ('xx', 'yy', 'zz', 'xy', 'yz', 'xz').
-            slice_bottom: Whether to slice the plot at the bottom.
+    def _extract_vertex_vector(
+        self,
+        vector: PETSc.Vec,
+        space: Any,
+        source_to_dof: np.ndarray,
+    ) -> np.ndarray:
+        block_size = space.dofmap.index_map_bs
+        dof_values = np.asarray(vector.array.real).reshape(-1, block_size)
+        return np.asarray(dof_values[source_to_dof], dtype=np.float64).copy()
+
+    def _interpolate_displacement_to_vertices(
+        self, displacement: fem.Function
+    ) -> fem.Function:
+        vertex_displacement = fem.Function(self.V_vertex)
+        expression = fem.Expression(
+            displacement,
+            self.V_vertex.element.interpolation_points(),
+        )
+        vertex_displacement.interpolate(expression)
+        vertex_displacement.x.scatter_forward()
+        return vertex_displacement
+
+    def _recover_stress_to_vertices(self, displacement: fem.Function) -> fem.Function:
+        """L2-project P2-derived stress into a continuous CG1 vertex field.
+
+        Stress from a CG2 displacement is cellwise linear but discontinuous at
+        shared vertices. The projection defines one reproducible value per
+        graph vertex instead of arbitrarily selecting an adjacent cell.
         """
-        # Map the string name to the correct Voigt array column index
-        voigt_indices = {"xx": 0, "yy": 1, "zz": 2, "xy": 3, "yz": 4, "xz": 5}
+        system = self._stress_projection
+        rhs = assemble_vector(
+            fem.form(ufl.inner(self.stress_voigt(displacement), system.test) * ufl.dx)
+        )
+        self._accumulate_ghost_values(rhs, populate_ghosts=True)
 
-        component = component.lower()
-        if component not in voigt_indices:
-            raise ValueError(
-                f"Invalid component '{component}'. Expected one of {list(voigt_indices.keys())}"
-            )
+        stress = fem.Function(system.space)
+        system.solver.solve(rhs, stress.x.petsc_vec)
+        stress.x.scatter_forward()
+        return stress
 
-        index = voigt_indices[component]
+    def run(self, loads: Iterable[Load]) -> SimulationResult:
+        """Solve in CG2 and export displacement, stress, and loads at CG1 vertices."""
+        normalized_loads: list[tuple[np.ndarray, np.ndarray]] = []
+        for point, force in loads:
+            point_array = np.asarray(point, dtype=np.float64)
+            force_array = np.asarray(force, dtype=np.float64)
+            if point_array.shape != (self.gdim,) or force_array.shape != (self.gdim,):
+                raise ValueError("Each contact point and force must be a 3D vector.")
+            if not np.all(np.isfinite(point_array)) or not np.all(
+                np.isfinite(force_array)
+            ):
+                raise ValueError("Contact points and forces must be finite.")
+            normalized_loads.append((point_array, force_array))
 
-        grid = self._build_grid(stress.function_space)
-        stress_array = stress.x.array.real.reshape(-1, 6)
-        grid.point_data[f"stress_{component}"] = stress_array[:, index]
-        return self._render_grid(
-            grid,
-            scalar_name=f"stress_{component}",
-            scalar_bar_title=f"Stress {component} (Pa)",
-            slice_bottom=slice_bottom,
+        # Construct each traction once and reuse it in both the P2 and P1 forms.
+        tractions = [self._traction(point, force) for point, force in normalized_loads]
+
+        # P2 RHS used by the actual elasticity solve.
+        rhs = assemble_vector(self._build_load_form(self.V_solve, tractions))
+        apply_lifting(rhs, [self.a], bcs=[[self.bc]])
+        self._accumulate_ghost_values(rhs, populate_ghosts=True)
+        set_bc(rhs, [self.bc])
+
+        displacement_fem = fem.Function(self.V_solve)
+        self.solver.solve(rhs, displacement_fem.x.petsc_vec)
+        displacement_fem.x.scatter_forward()
+
+        # Independently assemble the same continuous traction functional against
+        # CG1 basis functions. This is the correct P1 consistent nodal load; it
+        # is not obtained by discarding the P2 mid-edge entries.
+        force_vector_p1 = assemble_vector(
+            self._build_load_form(self.V_vertex, tractions)
+        )
+        self._accumulate_ghost_values(force_vector_p1, populate_ghosts=True)
+
+        displacement_p1 = self._interpolate_displacement_to_vertices(displacement_fem)
+        stress_p1 = self._recover_stress_to_vertices(displacement_fem)
+
+        displacement_vertices = self._extract_vertex_values(
+            displacement_p1, self._vertex_dofs_u
+        )
+        stress_vertices = self._extract_vertex_values(stress_p1, self._vertex_dofs_s)
+        nodal_forces_vertices = self._extract_vertex_vector(
+            force_vector_p1, self.V_vertex, self._vertex_dofs_u
+        )
+
+        # Partition of unity means the consistent nodal loads should preserve
+        # the applied resultant, up to integration tolerance.
+        expected_resultant = (
+            np.sum([force for _, force in normalized_loads], axis=0)
+            if normalized_loads
+            else np.zeros(self.gdim)
+        )
+        actual_resultant = nodal_forces_vertices.sum(axis=0)
+        np.testing.assert_allclose(
+            actual_resultant,
+            expected_resultant,
+            rtol=1e-6,
+            atol=1e-10,
+            err_msg="P1 nodal loads do not preserve the prescribed resultant.",
+        )
+
+        return SimulationResult(
+            displacement_fem=displacement_fem,
+            displacement_vertices=displacement_vertices,
+            stress_vertices=stress_vertices,
+            nodal_forces_vertices=nodal_forces_vertices,
         )

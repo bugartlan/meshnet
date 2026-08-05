@@ -109,6 +109,32 @@ class SurfaceGeodesics:
         """Indices mapping compact surface vertices to the input vertex array."""
         return self._vertex_indices
 
+    def closest_vertex(self, point: npt.ArrayLike) -> int:
+        """Return the compact index of the surface vertex nearest to ``point``.
+
+        The point is first projected onto its closest surface triangle. The
+        returned vertex is then selected from that triangle, which avoids
+        snapping across nearby, disconnected parts of a thin surface.
+        """
+        point_array = np.asarray(point, dtype=np.float64)
+        if point_array.shape != (3,) or not np.all(np.isfinite(point_array)):
+            raise ValueError("point must be a finite 3D coordinate")
+
+        cell_id, closest_point = self._surface_mesh.find_closest_cell(
+            point_array, return_closest_point=True
+        )
+        triangle = self._faces[int(cell_id)]
+        return int(
+            triangle[
+                np.argmin(
+                    np.linalg.norm(
+                        self._vertices[triangle] - closest_point,
+                        axis=1,
+                    )
+                )
+            ]
+        )
+
     def distance_from(self, source: npt.ArrayLike) -> npt.NDArray[np.float64]:
         """Compute distances from a surface point to all compact vertices.
 
@@ -136,17 +162,7 @@ class SurfaceGeodesics:
                 f"nearest-surface distance is {surface_offset:.6g}"
             )
 
-        triangle = self._faces[int(cell_id)]
-        source_vertex = int(
-            triangle[
-                np.argmin(
-                    np.linalg.norm(
-                        self._vertices[triangle] - closest_point,
-                        axis=1,
-                    )
-                )
-            ]
-        )
+        source_vertex = self.closest_vertex(closest_point)
         distances = np.asarray(
             self._solver.compute_distance(source_vertex),
             dtype=np.float64,

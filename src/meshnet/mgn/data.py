@@ -2,8 +2,6 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-import numpy.typing as npt
-import torch
 import trimesh
 from tqdm import tqdm
 
@@ -12,6 +10,8 @@ from meshnet.utils.mesh import Mesh
 
 
 class DataGenerator:
+    """Generate self-contained vertex-aligned FEM datasets."""
+
     def __init__(
         self,
         out_dir: Path,
@@ -19,169 +19,153 @@ class DataGenerator:
         num_contacts: int = 1,
         sigma: float = 0.001,
         seed: int = 42,
-        debug: bool = False,
-    ):
-        """
-        Args:
-            out_dir (Path): Output directory for saving data.
-            num_samples (int): Number of samples to generate per mesh.
-            num_contacts (int): Number of contact points per sample.
-            sigma (float): Standard deviation for Gaussian kernel in contact force application.
-            seed (int): Random seed for reproducibility.
-            debug (bool): If True, run in debug mode with verbose output.
-        """
+        solve_order: int = 2,
+    ) -> None:
         self.out_dir = out_dir
         self.out_dir.mkdir(parents=True, exist_ok=True)
-
         self.num_samples = num_samples
         self.num_contacts = num_contacts
         self.sigma = sigma
         self.seed = seed
-        self.debug = debug
-
+        self.solve_order = solve_order
         self.rng = np.random.default_rng(seed)
 
-    def process(self, filepath: Path) -> list[torch.Tensor]:
-        """Generate graphs with ground truth labels.
-
-        Args:
-            filepath (Path): Path to the mesh file.
-
-        Returns:
-            list[torch.Tensor]: A list of graphs with ground truth labels.
-        """
+    def process(self, filepath: Path) -> Path:
         if not filepath.exists():
             raise FileNotFoundError(f"Mesh file {filepath} not found.")
 
         mesh = Mesh.read(str(filepath))
-        points, forces = self._sample(mesh)
-        y = np.stack(self._simulate(mesh, points, forces))
+        contact_points, contact_forces = self._sample(mesh)
+
+        simulator = Simulator(
+            mesh,
+            order=self.solve_order,
+            contact_std=self.sigma,
+        )
+
+        vertex_displacement: list[np.ndarray] = []
+        vertex_stress: list[np.ndarray] = []
+        vertex_forces: list[np.ndarray] = []
+
+        for points_i, forces_i in tqdm(
+            zip(contact_points, contact_forces),
+            total=self.num_samples,
+        ):
+            result = simulator.run(zip(points_i, forces_i))
+            vertex_displacement.append(result.displacement_vertices)
+            vertex_stress.append(result.stress_vertices)
+            vertex_forces.append(result.nodal_forces_vertices)
+
+        displacement = np.stack(vertex_displacement)
+        stress = np.stack(vertex_stress)
+        nodal_forces = np.stack(vertex_forces)
+
+        vertices = np.asarray(mesh.volume.points, dtype=np.float64)
+        tetra = np.asarray(mesh.volume.cells_dict["tetra"], dtype=np.int64)
+        boundary_mask = np.isclose(vertices[:, 2], 0.0, atol=1e-6, rtol=0.0)
+
+        expected_shapes = {
+            "vertex_displacement": (self.num_samples, len(vertices), 3),
+            "vertex_stress": (self.num_samples, len(vertices), 6),
+            "vertex_forces": (self.num_samples, len(vertices), 3),
+        }
+        actual = {
+            "vertex_displacement": displacement.shape,
+            "vertex_stress": stress.shape,
+            "vertex_forces": nodal_forces.shape,
+        }
+        for name, expected in expected_shapes.items():
+            if actual[name] != expected:
+                raise RuntimeError(
+                    f"{name} is not aligned with the source vertices: "
+                    f"expected {expected}, got {actual[name]}."
+                )
 
         out_path = self.out_dir / f"{filepath.stem}.npz"
-        np.savez(
+        np.savez_compressed(
             out_path,
-            points=points,
-            forces=forces,
-            y=y,
+            # Static P1 graph mesh. Saving it makes the raw file self-contained.
+            vertices=vertices,
+            tetra=tetra,
+            boundary_mask=boundary_mask,
+            # Per-sample contact metadata.
+            contact_points=contact_points,
+            contact_forces=contact_forces,
+            # Per-sample arrays, all in exactly the same vertex order.
+            vertex_forces=nodal_forces,
+            vertex_displacement=displacement,
+            vertex_stress=stress,
+            # Provenance and schema metadata.
             mesh_path=np.asarray(str(filepath)),
-            sigma=np.asarray(self.sigma),
+            contact_std=np.asarray(self.sigma),
+            solve_order=np.asarray(self.solve_order),
             seed=np.asarray(self.seed),
-            schema_version=np.asarray(1),
+            schema_version=np.asarray(2),
         )
         return out_path
 
-    def _sample(self, mesh: Mesh, tol=0.01):
-        num_total_points = self.num_samples * self.num_contacts
+    def _sample(self, mesh: Mesh, tol: float = 0.01) -> tuple[np.ndarray, np.ndarray]:
+        total = self.num_samples * self.num_contacts
 
-        # Sample 2x buffer to account for filtering
         candidates, _ = trimesh.sample.sample_surface(
-            mesh.surface, count=num_total_points * 5, seed=self.seed
+            mesh.surface,
+            count=total * 5,
+            seed=self.seed,
         )
-        # Remove point near bottom (z=0)
-        candidates = candidates[candidates[:, 2] >= tol]
-        candidates = candidates[:num_total_points]
-
-        if len(candidates) < num_total_points:
+        candidates = candidates[candidates[:, 2] >= tol][:total]
+        if len(candidates) < total:
             raise ValueError(
-                f"Not enough valid contact points found. Needed {num_total_points}, got {len(candidates)}."
+                f"Not enough valid contact points: needed {total}, got {len(candidates)}."
             )
 
         points = candidates.reshape(self.num_samples, self.num_contacts, 3)
 
-        # Sample random forces
         directions = self.rng.standard_normal(
             size=(self.num_samples, self.num_contacts, 3)
         )
         directions /= np.linalg.norm(directions, axis=-1, keepdims=True)
-
         magnitudes = self.rng.uniform(
             0.0, 1.0, size=(self.num_samples, self.num_contacts, 1)
         )
-
         forces = directions * magnitudes
-
         return points, forces
 
-    def _simulate(
-        self,
-        mesh: Mesh,
-        points: npt.ArrayLike,
-        forces: npt.ArrayLike,
-    ) -> list[npt.NDArray[np.float64]]:
-        simulator = Simulator(mesh, std=self.sigma)
 
-        results = []
-        for p, f in tqdm(zip(points, forces)):
-            contacts = list(zip(p, f))
-            displacement = simulator.run(contacts)
-            stress = simulator.compute_stress(displacement, degree=1)
-            results.append(
-                np.hstack(
-                    [
-                        simulator.evaluate_mesh_points(displacement),
-                        simulator.evaluate_mesh_points(stress),
-                    ]
-                )
-            )
-
-        return results
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Generate simulation data from meshes."
-    )
-    parser.add_argument(
-        "meshes", type=Path, nargs="+", help="Paths to input mesh files or directories."
-    )
-    parser.add_argument(
-        "--out_dir",
-        type=Path,
-        default=Path("data"),
-        help="Output directory for saving data.",
-    )
-    parser.add_argument(
-        "--num_samples", type=int, default=1, help="Number of samples per mesh."
-    )
-    parser.add_argument(
-        "--num_contacts",
-        type=int,
-        default=1,
-        help="Number of contact points per sample.",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42, help="Random seed for reproducibility."
-    )
-    parser.add_argument(
-        "--debug", action="store_true", help="Enable debug mode with verbose output."
-    )
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate P2 FEM / P1 graph data.")
+    parser.add_argument("meshes", type=Path, nargs="+")
+    parser.add_argument("--out_dir", type=Path, default=Path("data/raw"))
+    parser.add_argument("--num_samples", type=int, default=1)
+    parser.add_argument("--num_contacts", type=int, default=1)
+    parser.add_argument("--sigma", type=float, default=0.01)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--solve_order", type=int, default=2)
     return parser.parse_args()
 
 
-def main():
+def main() -> None:
     args = parse_args()
-
     generator = DataGenerator(
         out_dir=args.out_dir,
         num_samples=args.num_samples,
         num_contacts=args.num_contacts,
-        sigma=0.01,
+        sigma=args.sigma,
         seed=args.seed,
-        debug=args.debug,
+        solve_order=args.solve_order,
     )
 
-    files = []
+    files: list[Path] = []
     for path in args.meshes:
         if path.is_file():
             files.append(path)
         elif path.is_dir():
-            files.extend(path.glob("*.msh"))
+            files.extend(sorted(path.glob("*.msh")))
         else:
             raise RuntimeError(f"Path {path} is not a file or directory.")
 
-    for f in files:
-        out_path = generator.process(f)
-        print(f"Saved data to {out_path}")
+    for filepath in files:
+        output = generator.process(filepath)
+        print(f"Saved raw FEM data to {output}")
 
 
 if __name__ == "__main__":
