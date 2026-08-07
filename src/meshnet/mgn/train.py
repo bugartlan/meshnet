@@ -74,6 +74,10 @@ def parse_args():
     """Parse and return command-line arguments."""
     p = argparse.ArgumentParser(description="Train model on a graph dataset.")
 
+    p.add_argument(
+        "dataset", type=str, help="Path to the graph dataset file or folder."
+    )
+
     # --- IO ---
     p.add_argument(
         "--output-dir",
@@ -86,12 +90,6 @@ def parse_args():
         type=str,
         default=None,
         help="Filename for the trained model file.",
-    )
-    p.add_argument(
-        "--dataset",
-        type=str,
-        default=None,
-        help="Name of the graph dataset file (without extension) or folder.",
     )
 
     # --- Loss Configuration ---
@@ -322,7 +320,7 @@ def build_model(config: ModelConfig, device: torch.device) -> EncodeProcessDecod
     Returns:
         Initialised model in training mode.
     """
-    return EncodeProcessDecode(
+    return MeshGraphNet(
         node_dim=config.node_dim,
         edge_dim=config.edge_dim,
         output_dim=config.output_dim,

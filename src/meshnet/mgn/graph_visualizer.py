@@ -181,7 +181,7 @@ class GraphVisualizer:
         return self.plot_field(
             graph=graph,
             field_data=force,
-            field_name="force",
+            field_name="force [N]",
             save_path=save_path,
             cmap=cmap,
             scalar_bar_args=scalar_bar_args,

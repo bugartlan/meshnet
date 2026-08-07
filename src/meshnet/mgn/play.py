@@ -132,9 +132,9 @@ def evaluate(
 
     true_surface_idx = geodesics.closest_vertex(peak_positions[true_max_idx])
     pred_surface_idx = geodesics.closest_vertex(peak_positions[pred_max_idx])
-    loss_peak_loc = geodesics.distance_from(
-        geodesics.vertices[true_surface_idx]
-    )[pred_surface_idx]
+    loss_peak_loc = geodesics.distance_from(geodesics.vertices[true_surface_idx])[
+        pred_surface_idx
+    ]
 
     return (loss_l1, loss_rel_l1, loss_top1_rel_l1, loss_peak_rel, loss_peak_loc)
 
@@ -467,16 +467,14 @@ def parse_args():
     p = argparse.ArgumentParser(description="Evaluate trained model on a dataset.")
 
     p.add_argument(
+        "dataset", type=str, help="Path to the graph dataset file or folder."
+    )
+
+    p.add_argument(
         "--checkpoint",
         type=str,
         default="model",
         help="Filename of the saved model checkpoint (no extension).",
-    )
-    p.add_argument(
-        "--dataset",
-        type=str,
-        default="",
-        help="Name of the graph dataset file (no extension).",
     )
     p.add_argument("--mode", choices=["all", "bottom"], default="all")
     p.add_argument(

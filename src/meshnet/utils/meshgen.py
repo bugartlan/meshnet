@@ -27,7 +27,7 @@ class Mesher:
     def _configure_gmsh(self):
         gmsh.option.setNumber("General.Verbosity", 2 if self.verbose else 1)
         gmsh.option.setNumber("Mesh.ElementOrder", self.element_order)
-        gmsh.option.setNumber("Mesh.CharacteristicLengthMin", self.element_size)
+        # gmsh.option.setNumber("Mesh.CharacteristicLengthMin", self.element_size)
         gmsh.option.setNumber("Mesh.CharacteristicLengthMax", self.element_size)
         gmsh.option.setString("Geometry.OCCTargetUnit", "M")
 
