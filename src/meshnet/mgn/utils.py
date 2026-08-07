@@ -4,6 +4,8 @@ import torch
 import trimesh
 from torch_geometric.data import Data
 
+from meshnet.utils.math import calculate_von_mises, stress_tensor_to_voigt
+
 
 def info(graph: Data, debug=False):
     graph.validate(raise_on_error=True)
@@ -73,12 +75,12 @@ def get_weight(
     return weight.repeat(1, dim)
 
 
-def grad_u(graph: Data):
-    i = graph.edge_index[0]  # source
-    j = graph.edge_index[1]  # destination
+def grad_u(x, edge_index, u):
+    i = edge_index[0]  # source
+    j = edge_index[1]  # destination
 
-    x = graph.x[:, :3]  # coords
-    u = graph.y[:, :3]  # displacements
+    x = x[:, :3]  # coords
+    u = u[:, :3]  # displacements
 
     dx = x[j] - x[i]  # edge vectors
     du = u[j] - u[i]  # displacement differences
@@ -111,8 +113,8 @@ def grad_u(graph: Data):
     return G
 
 
-def strain_stress_vm(graph: Data, E: float, nu: float):
-    G = grad_u(graph)  # [N, 3, 3]
+def stress_from_displacement(x, edge_index, u, E, nu):
+    G = grad_u(x, edge_index, u)  # [N, 3, 3]
 
     # Small strain tensor: eps = 0.5 * (G + G^T)
     eps = 0.5 * (G + G.mT)  # [N, 3, 3]
@@ -126,9 +128,7 @@ def strain_stress_vm(graph: Data, E: float, nu: float):
     I = torch.eye(3, dtype=eps.dtype, device=eps.device).unsqueeze(0)  # [1, 3, 3]
 
     sigma = lam * tr.view(-1, 1, 1) * I + 2 * mu * eps  # [N, 3, 3]
+    sigma_tensor = stress_tensor_to_voigt(sigma)  # [N, 6]
+    vm = calculate_von_mises(sigma_tensor)  # [N]
 
-    # Von Mises stress
-    s = sigma - torch.einsum("nii->n", sigma).view(-1, 1, 1) / 3 * I
-    vm = torch.sqrt(1.5 * (s * s).sum(dim=(1, 2)))  # [N]
-
-    return eps, sigma, vm
+    return eps, sigma_tensor, vm

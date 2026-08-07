@@ -120,14 +120,9 @@ class DataGenerator:
 
         points = candidates.reshape(self.num_samples, self.num_contacts, 3)
 
-        directions = self.rng.standard_normal(
-            size=(self.num_samples, self.num_contacts, 3)
-        )
-        directions /= np.linalg.norm(directions, axis=-1, keepdims=True)
-        magnitudes = self.rng.uniform(
-            0.0, 1.0, size=(self.num_samples, self.num_contacts, 1)
-        )
-        forces = directions * magnitudes
+        forces = self.rng.standard_normal(size=(self.num_samples, self.num_contacts, 3))
+        forces /= np.linalg.norm(forces, axis=-1, keepdims=True)
+
         return points, forces
 
 
