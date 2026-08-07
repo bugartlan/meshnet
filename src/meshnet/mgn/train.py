@@ -322,7 +322,7 @@ def build_model(config: ModelConfig, device: torch.device) -> EncodeProcessDecod
     Returns:
         Initialised model in training mode.
     """
-    return MeshGraphNet(
+    return EncodeProcessDecode(
         node_dim=config.node_dim,
         edge_dim=config.edge_dim,
         output_dim=config.output_dim,
@@ -399,10 +399,14 @@ def train_one_epoch(
         Average weighted loss across all active target values.
 
     Raises:
-        ValueError: If a NaN loss is detected.
+        ValueError: If a non-finite loss is detected.
     """
+    # Message aggregation sums many incident edges. FP16's maximum finite value
+    # (65504) is too small for this workload and can overflow activations before
+    # GradScaler gets a chance to inspect the gradients. BF16 has the range of
+    # FP32; callers only enable AMP when the CUDA device supports BF16.
     autocast_ctx = (
-        torch.autocast(device_type="cuda", dtype=torch.float16)
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         if use_amp
         else nullcontext()
     )
@@ -425,12 +429,24 @@ def train_one_epoch(
             remap[loss_mask] = torch.arange(int(loss_mask.sum()), device=device)
             local_edge_index = remap[batch.edge_index[:, edge_mask]]
 
-            loss_field = weighted_mse_loss(y_pred, y_true, weight)
-            loss_edge = edge_gradient_loss(y_pred, y_true, local_edge_index)
+            # Accumulate reductions in FP32 even when the forward pass uses AMP.
+            # Large meshes have enough nodes/edges for an FP16 sum to overflow.
+            loss_field = weighted_mse_loss(
+                y_pred.float(), y_true.float(), weight.float()
+            )
+            loss_edge = edge_gradient_loss(
+                y_pred.float(), y_true.float(), local_edge_index
+            )
             loss = loss_field + 1.0 * loss_edge
 
-        if torch.isnan(loss):
-            raise ValueError("Loss is NaN. Check data and model for issues.")
+        if not torch.isfinite(loss):
+            raise ValueError(
+                "Loss is non-finite: "
+                f"field={loss_field.item()}, edge={loss_edge.item()}, "
+                f"pred_finite={torch.isfinite(y_pred).all().item()}, "
+                f"target_finite={torch.isfinite(y_true).all().item()}, "
+                f"weight_finite={torch.isfinite(weight).all().item()}."
+            )
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -475,7 +491,9 @@ def train_model(
         List of average per-node losses, one entry per epoch.
     """
     model.train()
-    use_amp = device.type == "cuda"
+    # On pre-Ampere CUDA devices, prefer stable FP32 execution over FP16
+    # activation overflow in the graph message aggregation.
+    use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
     loss_history: list[float] = []
 
     progress_bar = tqdm(range(num_epochs), dynamic_ncols=True)
