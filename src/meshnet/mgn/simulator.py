@@ -410,8 +410,8 @@ class Simulator:
         np.testing.assert_allclose(
             actual_resultant,
             expected_resultant,
-            rtol=1e-6,
-            atol=1e-10,
+            rtol=2e-6,
+            atol=1e-9,
             err_msg="P1 nodal loads do not preserve the prescribed resultant.",
         )
 

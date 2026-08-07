@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch.nn import HuberLoss
 from torch.utils.tensorboard import SummaryWriter
 from torch_geometric.data import Batch
 from torch_geometric.loader import DataLoader
@@ -14,7 +15,7 @@ from tqdm import tqdm
 
 from meshnet.mgn.nets import EncodeProcessDecode, MeshGraphNet
 from meshnet.mgn.normalizer import GraphNormalizer
-from meshnet.mgn.utils import get_weight
+from meshnet.mgn.utils import get_weight, stress_from_displacement
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -254,39 +255,49 @@ def prepare_graphs_fast(
     """Normalize graphs and attach loss metadata for physical mesh nodes."""
     mode = "weighted" if weighted_loss else "all"
 
-    # 1. Collate all individual graphs into one giant Batch
     batch = Batch.from_data_list(graphs).to(device)
     normalizer.to(device)
 
-    # 2. Compute weights for every node. Virtual-node values are discarded below,
-    # so they cannot contribute to either the numerator or denominator of the loss.
-    weights = get_weight(
+    # Physical node mask
+    physical_node_mask = torch.zeros(batch.num_nodes, dtype=torch.bool, device=device)
+    for graph_index, graph in enumerate(graphs):
+        start = int(batch.ptr[graph_index].item())
+        n_phys = int(graph.num_physical_nodes)
+        physical_node_mask[start : start + n_phys] = True
+
+    batch.physical_node_mask = physical_node_mask
+
+    # Node weights
+
+    batch.weight = get_weight(
         batch.x[:, 2],
         num_targets,
         mode=mode,
         alpha=alpha,
     )
 
-    # 3. Mark the physical prefix of each graph explicitly. Using x[:, -1] is not
-    # safe: for graph builders without virtual nodes, the last feature is the
-    # boundary flag and real boundary nodes would be removed from the loss.
-    batch.loss_mask = torch.zeros(batch.num_nodes, dtype=torch.bool, device=device)
-    for graph_index, graph in enumerate(graphs):
-        start = int(batch.ptr[graph_index].item())
-        num_physical = int(graph.num_physical_nodes)
-        batch.loss_mask[start : start + num_physical] = True
-    batch.weight = weights
+    # Physical edge mask
+    src, dst = batch.edge_index
+    batch.physical_edge_mask = physical_node_mask[src] & physical_node_mask[dst]
 
-    # 4. Normalize the entire batch in one call
+    # Normalize graph features and targets
     batch = normalizer.normalize(batch)
 
-    # 5. Explode back into a list of individual graphs for the DataLoader
     graphs_out = batch.to_data_list()
-    for i, g in enumerate(graphs_out):
-        s = int(batch.ptr[i].item())
-        e = int(batch.ptr[i + 1].item())
-        g.weight = batch.weight[s:e]
-        g.loss_mask = batch.loss_mask[s:e]
+    for graph_index, graph in enumerate(graphs_out):
+        start = int(batch.ptr[graph_index].item())
+        end = int(batch.ptr[graph_index + 1].item())
+        num_physical = int(graph.num_physical_nodes)
+
+        graph.physical_node_mask = (
+            torch.arange(graph.num_nodes, device=graph.x.device) < num_physical
+        )
+        graph.weight = batch.weight[start:end]
+
+        src, dst = graph.edge_index
+        graph.physical_edge_mask = (
+            graph.physical_node_mask[src] & graph.physical_node_mask[dst]
+        )
 
     return graphs_out
 
@@ -356,7 +367,15 @@ def create_tensorboard_writer(args: argparse.Namespace, subdirectory: str):
 def weighted_mse_loss(
     pred: torch.Tensor, true: torch.Tensor, weight: torch.Tensor
 ) -> torch.Tensor:
-    return ((pred - true).square() * weight).sum() / weight.sum()
+    error = (pred - true).square()
+
+    if weight.ndim == 1:
+        weight = weight[:, None]
+
+    if weight.shape[-1] == 1 and error.shape[-1] != 1:
+        weight = weight.expand_as(error)
+
+    return (error * weight).sum() / weight.sum().clamp_min(1e-12)
 
 
 def edge_gradient_loss(
@@ -364,13 +383,10 @@ def edge_gradient_loss(
 ) -> torch.Tensor:
     src, dst = edge_index
 
-    pred_difference = pred[src] - pred[dst]
-    true_difference = true[src] - true[dst]
+    pred_diff = pred[src] - pred[dst]
+    true_diff = true[src] - true[dst]
 
-    return torch.nn.functional.mse_loss(
-        pred_difference,
-        true_difference,
-    )
+    return torch.nn.functional.mse_loss(pred_diff, true_diff)
 
 
 def train_one_epoch(
@@ -399,62 +415,100 @@ def train_one_epoch(
     Raises:
         ValueError: If a non-finite loss is detected.
     """
-    # Message aggregation sums many incident edges. FP16's maximum finite value
-    # (65504) is too small for this workload and can overflow activations before
-    # GradScaler gets a chance to inspect the gradients. BF16 has the range of
-    # FP32; callers only enable AMP when the CUDA device supports BF16.
+
     autocast_ctx = (
         torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         if use_amp
         else nullcontext()
     )
-    total_weighted_error = 0.0
+
+    total_loss = 0.0
     total_weight = 0.0
 
     for batch in loader:
         batch = batch.to(device)
-        optimizer.zero_grad()
+
+        optimizer.zero_grad(set_to_none=True)
 
         with autocast_ctx:
-            loss_mask = batch.loss_mask
-            y_pred = model(batch)[loss_mask][:, target_indices]
-            y_true = batch.y[loss_mask][:, target_indices]
-            weight = batch.weight[loss_mask]
+            pred_all = model(batch)
+            true_all = batch.y
 
-            src, dst = batch.edge_index
-            edge_mask = loss_mask[src] & loss_mask[dst]
-            remap = torch.full((batch.num_nodes,), -1, dtype=torch.long, device=device)
-            remap[loss_mask] = torch.arange(int(loss_mask.sum()), device=device)
-            local_edge_index = remap[batch.edge_index[:, edge_mask]]
+            physical_mask = batch.physical_node_mask
 
-            # Accumulate reductions in FP32 even when the forward pass uses AMP.
-            # Large meshes have enough nodes/edges for an FP16 sum to overflow.
+            u_pred_all = pred_all[:, :3]
+            sigma_pred_all = pred_all[:, 3:9]
+
+            pred_phys = pred_all[physical_mask]
+            true_phys = true_all[physical_mask]
+
+            weight = batch.weight[physical_mask]
+
+            # Field loss
+            pred_target = pred_phys[:, target_indices]
+            true_target = true_phys[:, target_indices]
+            if weight.ndim == 2:
+                if weight.shape[1] == pred_all.shape[1]:
+                    weight_target = weight[:, target_indices]
+                else:
+                    weight_target = weight
+            else:
+                weight_target = weight
+
             loss_field = weighted_mse_loss(
-                y_pred.float(), y_true.float(), weight.float()
+                pred_target.float(),
+                true_target.float(),
+                weight_target.float(),
             )
+
+            # Edge gradient loss
+            physical_edge_index = batch.edge_index[:, batch.physical_edge_mask]
             loss_edge = edge_gradient_loss(
-                y_pred.float(), y_true.float(), local_edge_index
+                pred_all[:, target_indices].float(),
+                true_all[:, target_indices].float(),
+                physical_edge_index,
             )
-            loss = loss_field + 1.0 * loss_edge
+
+            # Constitutive consistency loss
+            # loss_constitutive = pred_all.new_zeros(())
+
+            # sigma_pred_phys = sigma_pred_all[physical_mask]
+
+            # _, sigma_tensor_all, _ = stress_from_displacement(
+            #     batch.x, physical_edge_index, u_pred_all, E=2.0e9, nu=0.35
+            # )
+
+            # loss_constitutive = HuberLoss(reduction="mean")(
+            #     sigma_pred_phys, sigma_tensor_all[physical_mask]
+            # )
+
+            lambda_edge = 1.0
+            lambda_constitutive = 1.0
+
+            loss = (
+                loss_field + lambda_edge * loss_edge
+                # + lambda_constitutive * loss_constitutive
+            )
 
         if not torch.isfinite(loss):
             raise ValueError(
                 "Loss is non-finite: "
-                f"field={loss_field.item()}, edge={loss_edge.item()}, "
-                f"pred_finite={torch.isfinite(y_pred).all().item()}, "
-                f"target_finite={torch.isfinite(y_true).all().item()}, "
-                f"weight_finite={torch.isfinite(weight).all().item()}."
+                f"field={loss_field.item():.6e}, edge={loss_edge.item():.6e}, "
+                f"constitutive={loss_constitutive.item():.6e},"
+                f"pred_finite={torch.isfinite(pred_all).all().item()}, "
+                f"target_finite={torch.isfinite(true_all).all().item()}, "
             )
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
 
-        batch_weight = weight.sum().item()
-        total_weighted_error += loss.item() * batch_weight
+        batch_weight = weight_target.sum().item()
+
+        total_loss += loss.item() * batch_weight
         total_weight += batch_weight
 
-    return total_weighted_error / total_weight
+    return total_loss / max(1e-12, total_weight)
 
 
 def train_model(
@@ -489,8 +543,7 @@ def train_model(
         List of average per-node losses, one entry per epoch.
     """
     model.train()
-    # On pre-Ampere CUDA devices, prefer stable FP32 execution over FP16
-    # activation overflow in the graph message aggregation.
+
     use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
     loss_history: list[float] = []
 
