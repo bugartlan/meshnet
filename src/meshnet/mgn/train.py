@@ -470,25 +470,24 @@ def train_one_epoch(
             )
 
             # Constitutive consistency loss
-            loss_constitutive = pred_all.new_zeros(())
+            # loss_constitutive = pred_all.new_zeros(())
 
-            sigma_pred_phys = sigma_pred_all[physical_mask]
+            # sigma_pred_phys = sigma_pred_all[physical_mask]
 
-            _, sigma_tensor_all, _ = stress_from_displacement(
-                batch.x, physical_edge_index, u_pred_all, E=2.0e9, nu=0.35
-            )
+            # _, sigma_tensor_all, _ = stress_from_displacement(
+            #     batch.x, physical_edge_index, u_pred_all, E=2.0e9, nu=0.35
+            # )
 
-            loss_constitutive = HuberLoss(reduction="mean")(
-                sigma_pred_phys, sigma_tensor_all[physical_mask]
-            )
+            # loss_constitutive = HuberLoss(reduction="mean")(
+            #     sigma_pred_phys, sigma_tensor_all[physical_mask]
+            # )
 
             lambda_edge = 1.0
             lambda_constitutive = 1.0
 
             loss = (
-                loss_field
-                + lambda_edge * loss_edge
-                + lambda_constitutive * loss_constitutive
+                loss_field + lambda_edge * loss_edge
+                # + lambda_constitutive * loss_constitutive
             )
 
         if not torch.isfinite(loss):
