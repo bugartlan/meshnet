@@ -417,7 +417,7 @@ def save_prediction_visualizations(
             f"loss_rel_l1={result.loss_rel_l1:.2%}, "
             f"loss_top1_rel_l1={result.loss_top1_rel_l1:.2%}, "
             f"loss_peak_rel={result.loss_peak_rel:.2%}, "
-            f"loss_peak_loc={result.loss_peak_loc:.2%})."
+            f"loss_peak_loc={result.loss_peak_loc:.6f})."
         )
 
     # Save the sample with the highest relative error.
